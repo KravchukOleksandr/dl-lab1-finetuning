@@ -1,8 +1,6 @@
-# pip install ultralytics supervision==0.20.0 opencv-python ocsort-bytestrack
+# pip install ultralytics opencv-python
 from ultralytics import YOLO
-import supervision as sv
-import time
-import numpy as np
+import time, numpy as np
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, List
 
@@ -12,7 +10,7 @@ CLASS_MAP = {0: "male", 1: "female", 2: "staff", 3: "car"}
 class LineZone:
     name: str
     A: Tuple[int, int]
-    B: Tuple[int, int]   # сторона входа = левая относительно A->B
+    B: Tuple[int, int]   # «входная» сторона = левая относительно A->B
 
 @dataclass
 class Session:
@@ -28,9 +26,9 @@ class TrackState:
     dead_count: int = 0
     session: Optional[Session] = None
 
+# ---- геометрия ----
 def cross(z,w): return z[0]*w[1]-z[1]*w[0]
 def side(A,B,P): return cross(np.array(B)-A, np.array(P)-A)
-
 def seg_intersection(p, r, q, s):
     p,r,q,s = map(np.array,[p,r,q,s])
     r2, s2 = r-p, s-q
@@ -41,22 +39,29 @@ def seg_intersection(p, r, q, s):
     return 0 <= t <= 1 and 0 <= u <= 1
 
 class EventEngine:
+    """
+    Тот же интерфейс: process_frame(frame, ts=None) -> List[dict]
+    Трекинг через model.track(persist=True, tracker='bytetrack.yaml').
+    """
     def __init__(self, model_path:str, lines:List[LineZone], camera_id:int,
-                 conf=0.4, iou=0.5, min_hits=3, max_age=30, use_ocsort=True):
+                 conf=0.4, iou=0.5, min_hits=3, max_age=30,
+                 tracker_yaml: str = "bytetrack.yaml"):
         self.model = YOLO(model_path)
         self.lines = lines
         self.camera_id = camera_id
         self.conf, self.iou = conf, iou
         self.min_hits, self.max_age = min_hits, max_age
+        self.tracker_yaml = tracker_yaml
+
+        # состояние по track_id
         self.states: Dict[int, TrackState] = {}
-        self.tracker = sv.tracker.OCSort(min_hits=min_hits, max_age=max_age) \
-            if use_ocsort else sv.tracker.ByteTrack(track_buffer=max_age)
 
     def _fmt_time(self, ts:float)->str:
         return time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(ts))
 
-    def _close_emit(self, st:TrackState, exit_zone:str, t_now:float)->dict:
-        if st.session is None: return None
+    def _close_emit(self, st:TrackState, exit_zone:str, t_now:float)->Optional[dict]:
+        if st.session is None:
+            return None
         ev = {
             "object_type": CLASS_MAP.get(st.class_id, str(st.class_id)),
             "entry_time":  self._fmt_time(st.session.entry_time),
@@ -72,74 +77,92 @@ class EventEngine:
         st.session = Session(entry_time=t_now, entry_zone=entry_zone)
 
     def process_frame(self, frame, ts:Optional[float]=None)->List[dict]:
-        """На вход кадр и, опционально, timestamp (секунды). Возвращает список событий."""
+        """
+        На вход кадр (numpy array BGR/RGB — как в Ultralytics), опционально timestamp (секунды).
+        На выход — список 0..N событий в формате таблицы.
+        """
         t_now = ts if ts is not None else time.time()
         events: List[dict] = []
 
-        # --- детекция
-        y = self.model(frame, conf=self.conf, iou=self.iou, verbose=False)[0]
-        dets = []
-        for b, cls, conf in zip(y.boxes.xyxy.cpu().numpy(),
-                                y.boxes.cls.cpu().numpy(),
-                                y.boxes.conf.cpu().numpy()):
-            cls = int(cls)
-            if cls == 2:   # staff игнорируем
-                continue
-            x1,y1,x2,y2 = map(float, b)
-            cx, cy = (x1+x2)/2, (y1+y2)/2
-            dets.append(sv.Detection(xyxy=b, class_id=cls, confidence=conf,
-                                     data={"centroid":(cx,cy)}))
-
-        tracked = self.tracker.update_with_detections(
-            detections=sv.Detections.merge(dets)
+        # --- детекция+трекинг (persist=True сохраняет трекер между вызовами)
+        results = self.model.track(
+            source=frame,
+            conf=self.conf,
+            iou=self.iou,
+            stream=False,
+            persist=True,
+            verbose=False,
+            tracker=self.tracker_yaml
         )
+        # results — список из одного кадра
+        if not results:
+            return events
+        r = results[0]
 
-        seen = set()
+        seen: set[int] = set()
 
-        # --- обработка живых треков
-        for i in range(len(tracked)):
-            tid = int(tracked.tracker_id[i])
-            cls = int(tracked.class_id[i])
-            cx, cy = tracked.data["centroid"][i]
-            seen.add(tid)
+        # извлекаем боксы
+        boxes = r.boxes
+        if boxes is not None and len(boxes) > 0:
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls  = boxes.cls.cpu().numpy().astype(int)
+            conf = boxes.conf.cpu().numpy()
+            ids  = boxes.id  # может быть None на первых кадрах
+            ids  = None if ids is None else ids.cpu().numpy().astype(int)
 
-            st = self.states.get(tid) or TrackState(class_id=cls)
-            self.states[tid] = st
-            st.class_id = cls
-            st.last_seen_time = t_now
-            st.confirmed_hits = min(self.min_hits, st.confirmed_hits+1)
+            for i in range(len(xyxy)):
+                class_id = int(cls[i])
+                if class_id == 2:  # staff — полностью игнорируем
+                    continue
+                if ids is None:    # пока нет id — пропускаем
+                    continue
+                tid = int(ids[i])
+                seen.add(tid)
 
-            # класс 3: только появление/исчезновение
-            if cls == 3:
+                x1,y1,x2,y2 = xyxy[i]
+                cx, cy = (x1+x2)/2.0, (y1+y2)/2.0
+
+                st = self.states.get(tid)
+                if st is None:
+                    st = TrackState(class_id=class_id)
+                    self.states[tid] = st
+
+                st.class_id = class_id
+                st.last_seen_time = t_now
+                st.confirmed_hits = min(self.min_hits, st.confirmed_hits + 1)
+
+                # класс 3: считаем только появление/исчезновение
+                if class_id == 3:
+                    if st.session is None and st.confirmed_hits >= self.min_hits:
+                        self._open(st, "None", t_now)
+                    st.last_point = (cx, cy); st.dead_count = 0
+                    continue
+
+                # появление → вход в None
                 if st.session is None and st.confirmed_hits >= self.min_hits:
                     self._open(st, "None", t_now)
-                st.last_point = (cx, cy); st.dead_count = 0
-                continue
 
-            # появление: вход в None
-            if st.session is None and st.confirmed_hits >= self.min_hits:
-                self._open(st, "None", t_now)
+                # пересечения линий
+                if st.last_point is not None and st.session is not None:
+                    p_prev, p_cur = st.last_point, (cx, cy)
+                    for L in self.lines:
+                        if not seg_intersection(p_prev, p_cur, L.A, L.B):
+                            continue
+                        # выход всегда по зоне линии
+                        ev = self._close_emit(st, exit_zone=L.name, t_now=t_now)
+                        if ev: events.append(ev)
+                        # направление: «вход» — если были слева от A->B
+                        s_prev = np.sign(side(np.array(L.A), np.array(L.B), np.array(p_prev)))
+                        self._open(st, L.name if s_prev>0 else "None", t_now)
+                        break
 
-            # пересечения линий
-            if st.last_point is not None and st.session is not None:
-                p_prev, p_cur = st.last_point, (cx, cy)
-                for L in self.lines:
-                    if not seg_intersection(p_prev, p_cur, L.A, L.B):
-                        continue
-                    # выход всегда по линии L
-                    ev = self._close_emit(st, L.name, t_now)
-                    if ev: events.append(ev)
-                    # направление: «входная» = левая сторона до перехода
-                    s_prev = np.sign(side(np.array(L.A), np.array(L.B), np.array(p_prev)))
-                    self._open(st, L.name if s_prev>0 else "None", t_now)
-                    break
+                st.last_point = (cx, cy)
+                st.dead_count = 0
 
-            st.last_point = (cx, cy)
-            st.dead_count = 0
-
-        # --- умершие (исчезли) → выход в None
+        # --- исчезнувшие треки → выход в None
         for tid, st in list(self.states.items()):
-            if tid in seen: continue
+            if tid in seen:
+                continue
             st.dead_count += 1
             if st.dead_count > self.max_age:
                 if st.session is not None:
@@ -148,16 +171,3 @@ class EventEngine:
                 del self.states[tid]
 
         return events
-
-
-lines = [
-    LineZone("Entrance 1", (100,200), (540,200)),
-    LineZone("Entrance 2", (200,400), (700,400)),
-]
-engine = EventEngine("yolov8n.pt", lines, camera_id=1)
-
-# В твоём цикле чтения камеры:
-events = engine.process_frame(frame, ts=your_timestamp)
-for row in events:
-    # row уже готов для записи/отправки
-    print(row)
