@@ -53,11 +53,10 @@ def build_yolo(local_path):
 
 def build_convnext():
     import timm
-    return timm.create_model("convnextv2_atto", pretrained=True)
+    return timm.create_model("convnextv2_atto", pretrained=False)
 
 def build_mnv4():
     import timm
-    # pretrained=False, т.к. официальных весов пока нет
     return timm.create_model("mobilenetv4_conv_small", pretrained=False)
 
 # -------- main --------
