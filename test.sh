@@ -17,11 +17,8 @@ if [ -f "$ENGINE_PATH" ]; then
     echo "Found existing TensorRT engine. Skipping export."
 else
     echo "TensorRT engine not found. Exporting..."
-    # Check if TensorRT Python module is available
-    python - <<'PY'
-import importlib.util, sys
-sys.exit(0 if importlib.util.find_spec('tensorrt') else 1)
-PY
+    # Check if TensorRT Python module is available (safe inline check)
+    python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('tensorrt') else 1)" \
     && yolo export model="$PT_PATH" format=engine device=0 imgsz={imgsz} dynamic=False half=True nms=True \
     || (echo "TensorRT module not found. Falling back to ONNX + trtexec export..." && \
         yolo export model="$PT_PATH" format=onnx imgsz={imgsz} dynamic=False && \
