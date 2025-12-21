@@ -46,39 +46,28 @@ def build_clusters_dsu(I: np.ndarray, D: np.ndarray | None = None, dist_thr: int
     return roots
 
 
-import numpy as np
-
-def pick_time_distributed_per_cluster(roots: np.ndarray, ts: np.ndarray, k: int):
+def select_time_distributed(roots: np.ndarray, ts: np.ndarray, k_keep: int) -> np.ndarray:
     """
-    roots: (N,) int cluster root per sample
-    ts: (N,) sortable timestamps (int64, datetime64 ok)
-    returns: mask (N,) bool selected
+    roots: (N,) int cluster id
+    ts: (N,) float unix time
+    returns: selected mask (N,) bool
     """
-    selected = np.zeros(len(roots), dtype=bool)
+    N = len(roots)
+    selected = np.zeros(N, dtype=bool)
 
-    # группируем индексы по root
-    # быстрый способ: сортировка по roots
     order = np.argsort(roots)
     roots_sorted = roots[order]
 
     start = 0
-    while start < len(order):
+    while start < N:
         r = roots_sorted[start]
         end = start
-        while end < len(order) and roots_sorted[end] == r:
+        while end < N and roots_sorted[end] == r:
             end += 1
 
-        idx = order[start:end]                 # индексы элементов кластера
-        idx = idx[np.argsort(ts[idx])]         # отсортировали по времени
-        n = len(idx)
-
-        if n <= k:
-            selected[idx] = True
-        else:
-            # квантильные позиции
-            # i=0..k-1 => round(i*(n-1)/(k-1))
-            pos = [round(i*(n-1)/(k-1)) for i in range(k)]
-            selected[idx[pos]] = True
+        cluster_idx = order[start:end]  # индексы элементов этого кластера
+        picked = pick_k_time_buckets(cluster_idx, ts, k_keep)
+        selected[picked] = True
 
         start = end
 
