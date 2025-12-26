@@ -1,0 +1,16 @@
+azure:
+  connection_string: "DefaultEndpointsProtocol=...;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+  container: "your-container-name"
+  filtered_prefix: "meta/"     # где лежат <cam>_filtered.csv
+
+splits:
+  train_ratio: 0.8             # первые 80% строк по created_ts -> train
+
+thresholds:
+  yolo_thr: 0.25
+  cnext_thr: 0.5
+  tolerance: 0.1
+
+ui:
+  window_width: 1500
+  window_height: 780
