@@ -1,0 +1,505 @@
+import os
+import math
+import tkinter as tk
+from tkinter import ttk, messagebox
+from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageTk
+
+from .blob_io import AzureBlobIO, BlobCache, Prefetcher
+from .state_db import (
+    init_state_db,
+    get_labels_for_cam,
+    upsert_label,
+    is_frame_exported,
+    mark_frame_exported,
+    is_box_exported,
+    mark_box_exported,
+)
+from .dataset_export import (
+    export_convnext_crop,
+    export_yolo_frame,
+    should_export_on_tp,
+    should_export_on_fp,
+)
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def unix_to_kyiv_str(unix_ts: float) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(unix_ts), tz=ZoneInfo("UTC")).astimezone(KYIV_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return "N/A"
+
+def compute_split_by_count(df: pd.DataFrame, ratio: float) -> np.ndarray:
+    n = len(df)
+    if n == 0:
+        return np.array([], dtype=object)
+    created = df["created_ts"].to_numpy(dtype=float)
+    order = np.lexsort((np.arange(n), created))  # stable by index
+    cut = int(math.ceil(ratio * n))
+    split = np.empty(n, dtype=object)
+    split[order[:cut]] = "train"
+    split[order[cut:]] = "val"
+    return split
+
+def subsample_df(df: pd.DataFrame, k: int, mode: str) -> pd.DataFrame:
+    """
+    Возвращает подвыборку df (стабильно).
+    mode:
+      - first_k: первые k после сортировки по created_ts
+      - uniform_time: k равномерно по created_ts (по индексам после сортировки)
+    """
+    if k <= 0 or len(df) <= k:
+        return df
+
+    if "created_ts" not in df.columns:
+        # fallback: просто первые k как есть
+        return df.iloc[:k].copy()
+
+    order = np.lexsort((np.arange(len(df)), df["created_ts"].to_numpy(dtype=float)))
+    if mode == "first_k":
+        chosen = order[:k]
+        chosen = np.sort(chosen)  # вернуть в исходном порядке (приятнее листать)
+        return df.iloc[chosen].copy()
+
+    # uniform_time
+    pos = np.linspace(0, len(order) - 1, k)
+    pos = np.round(pos).astype(int)
+    pos = np.unique(pos)
+    # добор, если unique уменьшил количество
+    t = 0
+    while len(pos) < k:
+        cand = min(len(order) - 1, pos[-1] + 1) if t % 2 == 0 else max(0, pos[0] - 1)
+        pos = np.unique(np.append(pos, cand))
+        t += 1
+
+    chosen = order[pos[:k]]
+    chosen = np.sort(chosen)  # назад в исходный порядок
+    return df.iloc[chosen].copy()
+
+class ImageCanvas(ttk.Frame):
+    def __init__(self, master, width=540, height=540):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, width=width, height=height, bg="#222222", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self._img_pil = None
+        self._img_tk = None
+
+        self.scale = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        self._drag_start = None
+
+        self.overlay_rect = None
+        self.overlay_enabled = True
+
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-4>", self._on_mousewheel)
+        self.canvas.bind("<Button-5>", self._on_mousewheel)
+        self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
+        self.canvas.bind("<B1-Motion>", self._on_drag_move)
+
+    def set_image(self, pil_img: Image.Image):
+        self._img_pil = pil_img
+        self.scale = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        self._redraw()
+
+    def set_overlay(self, rect_or_none):
+        self.overlay_rect = rect_or_none
+        self._redraw()
+
+    def set_overlay_enabled(self, enabled: bool):
+        self.overlay_enabled = enabled
+        self._redraw()
+
+    def _on_mousewheel(self, event):
+        if self._img_pil is None:
+            return
+        if hasattr(event, "delta") and event.delta != 0:
+            factor = 1.1 if event.delta > 0 else 0.9
+        else:
+            factor = 1.1 if event.num == 4 else 0.9
+        self.scale = max(0.1, min(10.0, self.scale * factor))
+        self._redraw()
+
+    def _on_drag_start(self, event):
+        self._drag_start = (event.x, event.y)
+
+    def _on_drag_move(self, event):
+        if self._drag_start is None:
+            return
+        dx = event.x - self._drag_start[0]
+        dy = event.y - self._drag_start[1]
+        self.offset_x += dx
+        self.offset_y += dy
+        self._drag_start = (event.x, event.y)
+        self._redraw()
+
+    def _redraw(self):
+        self.canvas.delete("all")
+        if self._img_pil is None:
+            return
+
+        w, h = self._img_pil.size
+        new_w = max(1, int(w * self.scale))
+        new_h = max(1, int(h * self.scale))
+        resized = self._img_pil.resize((new_w, new_h), Image.BILINEAR)
+        self._img_tk = ImageTk.PhotoImage(resized)
+
+        cx = self.canvas.winfo_width() // 2 + self.offset_x
+        cy = self.canvas.winfo_height() // 2 + self.offset_y
+        self.canvas.create_image(cx, cy, image=self._img_tk, anchor="center")
+
+        if self.overlay_enabled and self.overlay_rect is not None:
+            x1, y1, x2, y2 = self.overlay_rect
+            img_left = cx - (w * self.scale) / 2
+            img_top = cy - (h * self.scale) / 2
+            X1 = img_left + x1 * self.scale
+            Y1 = img_top + y1 * self.scale
+            X2 = img_left + x2 * self.scale
+            Y2 = img_top + y2 * self.scale
+            self.canvas.create_rectangle(X1, Y1, X2, Y2, outline="red", width=2)
+
+@dataclass
+class Paths:
+    work_dir: str
+    filtered_dir: str
+    cache_boxes: str
+    cache_frames: str
+    state_dir: str
+    convnext_dir: str
+    yolo_dir: str
+
+class LabelGUI(tk.Tk):
+    def __init__(
+        self,
+        blobio: AzureBlobIO,
+        paths: Paths,
+        split_ratio: float,
+        yolo_thr: float,
+        cnext_thr: float,
+        tolerance: float,
+        sampling_enabled: bool = False,
+        max_per_camera: int = 0,
+        sampling_mode: str = "uniform_time",
+        sampling_seed: int = 123,   # резерв на будущее
+    ):
+        super().__init__()
+        self.title("Labeler: TP / FP / Skip")
+
+        self.blobio = blobio
+        self.paths = paths
+        self.split_ratio = float(split_ratio)
+        self.yolo_thr = float(yolo_thr)
+        self.cnext_thr = float(cnext_thr)
+        self.tolerance = float(tolerance)
+
+        self.sampling_enabled = bool(sampling_enabled)
+        self.max_per_camera = int(max_per_camera or 0)
+        self.sampling_mode = str(sampling_mode or "uniform_time").lower()
+        self.sampling_seed = int(sampling_seed)
+
+        ensure_dir(self.paths.filtered_dir)
+        ensure_dir(self.paths.cache_boxes)
+        ensure_dir(self.paths.cache_frames)
+        ensure_dir(self.paths.state_dir)
+        ensure_dir(self.paths.convnext_dir)
+        ensure_dir(self.paths.yolo_dir)
+
+        for split in ["train", "val"]:
+            for cls in ["TP", "FP"]:
+                ensure_dir(os.path.join(self.paths.convnext_dir, split, cls))
+
+        self.cache = BlobCache(self.blobio, self.paths.cache_boxes, self.paths.cache_frames)
+        self.prefetcher = Prefetcher(self.cache)
+
+        self.con = init_state_db(os.path.join(self.paths.state_dir, "state.db"))
+
+        self.df = None
+        self.splits = None
+        self.cam = None
+        self.ptr = 0
+
+        self.labels_map: dict[str, str] = {}
+
+        self.total_in_view = 0
+        self.labeled_in_view = 0
+
+        self.show_bbox_var = tk.BooleanVar(value=True)
+
+        self._build_ui()
+        self._load_cameras()
+
+    def _build_ui(self):
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(top, text="Camera:").pack(side="left")
+        self.cam_combo = ttk.Combobox(top, values=[], state="readonly", width=30)
+        self.cam_combo.pack(side="left", padx=6)
+        self.cam_combo.bind("<<ComboboxSelected>>", lambda e: self.load_camera())
+
+        # NEW: progress indicator
+        self.progress_lbl = ttk.Label(top, text="Progress: 0/0")
+        self.progress_lbl.pack(side="left", padx=14)
+
+        ttk.Checkbutton(top, text="Show bbox on frame", variable=self.show_bbox_var, command=self._toggle_bbox).pack(side="right")
+
+        mid = ttk.Frame(self)
+        mid.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.box_view = ImageCanvas(mid, width=520, height=520)
+        self.box_view.pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.frame_view = ImageCanvas(mid, width=880, height=520)
+        self.frame_view.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        meta = ttk.Frame(self)
+        meta.pack(fill="x", padx=8, pady=(0, 8))
+        self.meta_lbl = ttk.Label(meta, text="(metadata)", justify="left")
+        self.meta_lbl.pack(side="left")
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(0, 12))
+
+        self.btn_prev = ttk.Button(btns, text="<= (prev)", command=self.go_prev)
+        self.btn_prev.pack(side="left", padx=6)
+
+        self.btn_next = ttk.Button(btns, text="=> (next)", command=self.go_next)
+        self.btn_next.pack(side="left", padx=6)
+
+        self.btn_tp = ttk.Button(btns, text="TP (человек)", command=lambda: self.on_label("TP"))
+        self.btn_tp.pack(side="left", padx=10)
+
+        self.btn_fp = ttk.Button(btns, text="FP (галлюцинация)", command=lambda: self.on_label("FP"))
+        self.btn_fp.pack(side="left", padx=6)
+
+        self.btn_skip = ttk.Button(btns, text="Skip", command=lambda: self.on_label("SKIP"))
+        self.btn_skip.pack(side="left", padx=6)
+
+        # labeling hotkeys
+        self.bind("<Right>", lambda e: self.on_label("TP"))
+        self.bind("<Left>", lambda e: self.on_label("FP"))
+        self.bind("<Down>", lambda e: self.on_label("SKIP"))
+
+        # navigation hotkeys
+        self.bind("<Control-Left>", lambda e: self.go_prev())
+        self.bind("<Control-Right>", lambda e: self.go_next())
+        self.bind("a", lambda e: self.go_prev())
+        self.bind("d", lambda e: self.go_next())
+
+    def _toggle_bbox(self):
+        self.frame_view.set_overlay_enabled(bool(self.show_bbox_var.get()))
+
+    def _load_cameras(self):
+        cams = self.blobio.list_cameras()
+        self.cam_combo["values"] = cams
+        if cams:
+            self.cam_combo.current(0)
+            self.load_camera()
+
+    def _update_progress_label(self):
+        self.progress_lbl.configure(text=f"Progress: {self.labeled_in_view}/{self.total_in_view}")
+
+    def load_camera(self):
+        cam = self.cam_combo.get().strip()
+        if not cam:
+            return
+
+        local_csv = os.path.join(self.paths.filtered_dir, f"{cam}_filtered.csv")
+        if not os.path.exists(local_csv):
+            self.blobio.download_filtered_csv(cam, local_csv)
+
+        self.cam = cam
+        df = pd.read_csv(local_csv)
+
+        required = ["box_blob","frame_blob","x1","y1","x2","y2","yolo_score","cnext_sscore","created_ts"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            messagebox.showerror("Bad CSV", f"Missing columns: {missing}")
+            return
+
+        # Apply optional sampling per camera
+        if self.sampling_enabled and self.max_per_camera > 0:
+            df = subsample_df(df, self.max_per_camera, self.sampling_mode)
+
+        self.df = df.reset_index(drop=True)
+
+        self.splits = compute_split_by_count(self.df, self.split_ratio)
+
+        # load labels for this cam (box_blob -> label)
+        self.labels_map = get_labels_for_cam(self.con, cam)
+
+        # progress for current view
+        self.total_in_view = len(self.df)
+        if self.total_in_view == 0:
+            self.labeled_in_view = 0
+        else:
+            # fast count via isin
+            bb = self.df["box_blob"].astype(str)
+            self.labeled_in_view = int(bb.isin(set(self.labels_map.keys())).sum())
+        self._update_progress_label()
+
+        # resume to first unlabeled, else allow browsing from start
+        self.ptr = 0
+        while self.ptr < len(self.df) and str(self.df.iloc[self.ptr]["box_blob"]) in self.labels_map:
+            self.ptr += 1
+        if self.ptr >= len(self.df):
+            self.ptr = 0
+
+        self.show_current()
+
+    def go_prev(self):
+        if self.df is None:
+            return
+        if self.ptr > 0:
+            self.ptr -= 1
+            self.show_current()
+
+    def go_next(self):
+        if self.df is None:
+            return
+        if self.ptr < len(self.df) - 1:
+            self.ptr += 1
+            self.show_current()
+
+    def _update_label_buttons_state(self, box_blob: str):
+        labeled = box_blob in self.labels_map
+        state = "disabled" if labeled else "normal"
+        self.btn_tp.configure(state=state)
+        self.btn_fp.configure(state=state)
+        self.btn_skip.configure(state=state)
+
+    def show_current(self):
+        if self.df is None or self.ptr < 0 or self.ptr >= len(self.df):
+            return
+
+        row = self.df.iloc[self.ptr]
+        box_blob = str(row["box_blob"])
+        frame_blob = str(row["frame_blob"])
+
+        # Prefetch next row
+        if self.ptr + 1 < len(self.df):
+            nrow = self.df.iloc[self.ptr + 1]
+            self.prefetcher.prefetch(str(nrow["box_blob"]), str(nrow["frame_blob"]))
+
+        try:
+            box_path = self.cache.get_box(box_blob)
+            frame_path = self.cache.get_frame(frame_blob)
+        except Exception as e:
+            messagebox.showerror("Download error", str(e))
+            return
+
+        box_img = Image.open(box_path).convert("RGB")
+        frame_img = Image.open(frame_path).convert("RGB")
+
+        self.box_view.set_image(box_img)
+        self.frame_view.set_image(frame_img)
+
+        rect = (float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"]))
+        self.frame_view.set_overlay(rect)
+        self.frame_view.set_overlay_enabled(bool(self.show_bbox_var.get()))
+
+        split = str(self.splits[self.ptr])
+        created_ts = float(row["created_ts"])
+        kyiv_time = unix_to_kyiv_str(created_ts)
+
+        labeled_status = self.labels_map.get(box_blob, "UNLABELED")
+        self._update_label_buttons_state(box_blob)
+
+        self.meta_lbl.configure(text=
+            f"cam: {self.cam} | row: {self.ptr+1}/{len(self.df)} | split: {split} | status: {labeled_status}\n"
+            f"yolo_score: {row['yolo_score']} | cnext_sscore: {row['cnext_sscore']} | phash: {row.get('phash','')}\n"
+            f"created_ts (Kyiv): {kyiv_time}\n"
+            f"box: {os.path.basename(box_blob)}\n"
+            f"frame: {os.path.basename(frame_blob)}"
+        )
+
+    def _advance_to_next_unlabeled_from(self, start: int) -> int | None:
+        if self.df is None:
+            return None
+        i = start
+        while i < len(self.df):
+            bb = str(self.df.iloc[i]["box_blob"])
+            if bb not in self.labels_map:
+                return i
+            i += 1
+        return None
+
+    def on_label(self, label: str):
+        if self.df is None or self.cam is None:
+            return
+        if self.ptr < 0 or self.ptr >= len(self.df):
+            return
+
+        row = self.df.iloc[self.ptr]
+        box_blob = str(row["box_blob"])
+
+        # do not relabel
+        if box_blob in self.labels_map:
+            return
+
+        frame_blob = str(row["frame_blob"])
+        created_ts = float(row["created_ts"])
+        split = str(self.splits[self.ptr])
+
+        # store label
+        upsert_label(self.con, self.cam, box_blob, label, created_ts)
+        self.labels_map[box_blob] = label
+
+        # update progress instantly
+        self.labeled_in_view += 1
+        self._update_progress_label()
+
+        yolo_score = float(row["yolo_score"])
+        cnext_score = float(row["cnext_sscore"])
+
+        if label == "TP":
+            export_frame, export_crop_tp = should_export_on_tp(
+                yolo_score, cnext_score, self.yolo_thr, self.cnext_thr, self.tolerance
+            )
+            if export_crop_tp and not is_box_exported(self.con, box_blob, "TP"):
+                box_path = self.cache.get_box(box_blob)
+                export_convnext_crop(box_path, self.paths.convnext_dir, split, "TP", box_blob)
+                mark_box_exported(self.con, self.cam, box_blob, split, "TP")
+
+            if export_frame and not is_frame_exported(self.con, frame_blob):
+                frame_path = self.cache.get_frame(frame_blob)
+                export_yolo_frame(frame_path, self.paths.yolo_dir, self.cam, split, frame_blob)
+                mark_frame_exported(self.con, self.cam, frame_blob, split)
+
+        elif label == "FP":
+            export_frame, export_crop_fp = should_export_on_fp(
+                yolo_score, cnext_score, self.yolo_thr, self.cnext_thr, self.tolerance
+            )
+            if export_crop_fp and not is_box_exported(self.con, box_blob, "FP"):
+                box_path = self.cache.get_box(box_blob)
+                export_convnext_crop(box_path, self.paths.convnext_dir, split, "FP", box_blob)
+                mark_box_exported(self.con, self.cam, box_blob, split, "FP")
+
+            if export_frame and not is_frame_exported(self.con, frame_blob):
+                frame_path = self.cache.get_frame(frame_blob)
+                export_yolo_frame(frame_path, self.paths.yolo_dir, self.cam, split, frame_blob)
+                mark_frame_exported(self.con, self.cam, frame_blob, split)
+
+        # next unlabeled jump
+        nxt = self._advance_to_next_unlabeled_from(self.ptr + 1)
+        if nxt is None:
+            self.show_current()
+            messagebox.showinfo("Done", "Дальше нет неразмеченных (можно листать вручную).")
+            return
+        self.ptr = nxt
+        self.show_current()
