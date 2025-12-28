@@ -1,0 +1,22 @@
+azure:
+  connection_string: "..."
+  container: "your-container-name"
+  filtered_prefix: "meta/"
+
+splits:
+  train_ratio: 0.8
+
+thresholds:
+  yolo_thr: 0.25
+  cnext_thr: 0.5
+  tolerance: 0.1
+
+sampling:
+  enabled: true
+  max_per_camera: 5000          # k (если 0 или null — без лимита)
+  mode: "uniform_time"          # "first_k" | "uniform_time"
+  seed: 123                     # на будущее (для random), сейчас не обязателен
+
+ui:
+  window_width: 1500
+  window_height: 780
