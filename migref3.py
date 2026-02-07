@@ -20,3 +20,16 @@ def _has_unbound_plane_indices(self) -> bool:
                 if int(arr[i]) == -1:
                     return True
     return False
+
+
+
+def _has_valid_zone_polygons(self) -> bool:
+    """
+    Returns True if zone contains at least one valid polygon
+    (polygon with >= 3 vertices).
+    """
+    for polys in self.zone.values():
+        for poly in polys:
+            if len(poly) >= 3:
+                return True
+    return False
