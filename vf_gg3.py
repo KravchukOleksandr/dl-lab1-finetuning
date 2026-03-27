@@ -127,3 +127,22 @@ def plot_histograms(hist1: np.ndarray, hist2: np.ndarray):
     plt.suptitle(f"Bhattacharyya distance: {dist:.3f}")
     plt.tight_layout()
     plt.show()
+
+# crop
+mask1_c = crop_mask_by_points(mask1, pts1)
+mask2_c = crop_mask_by_points(mask2, pts2)
+
+# paint
+paint1 = compute_paint_mask(img1, mask1_c)
+paint2 = compute_paint_mask(img2, mask2_c)
+
+# hist
+h1 = compute_color_histogram(img1, paint1)
+h2 = compute_color_histogram(img2, paint2)
+
+# compare
+dist = compare_histograms(h1, h2)
+print(dist)
+
+# visualize
+plot_histograms(h1, h2)
