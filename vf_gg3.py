@@ -3,114 +3,111 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-# -------------------------
-# 1. Crop mask by keypoints
-# -------------------------
-def crop_mask_by_points(mask: np.ndarray, points: np.ndarray, margin: int = 5) -> np.ndarray:
+def crop_mask_by_points(mask: np.ndarray, points: np.ndarray) -> np.ndarray:
     """
-    Zero-out everything outside bbox of keypoints.
+    Crop a binary mask by the tight bounding box of keypoints.
+
+    Args:
+        mask:
+            Binary mask of shape (H, W).
+        points:
+            Array of shape (N, 2) with point coordinates in (x, y) format.
+
+    Returns:
+        Cropped mask of the same shape.
     """
     x = points[:, 0]
     y = points[:, 1]
 
-    x1 = max(0, int(x.min()) - margin)
-    x2 = min(mask.shape[1], int(x.max()) + margin)
-
-    y1 = max(0, int(y.min()) - margin)
-    y2 = min(mask.shape[0], int(y.max()) + margin)
+    x1 = max(0, int(np.floor(x.min())))
+    x2 = min(mask.shape[1], int(np.ceil(x.max())))
+    y1 = max(0, int(np.floor(y.min())))
+    y2 = min(mask.shape[0], int(np.ceil(y.max())))
 
     out = np.zeros_like(mask)
     out[y1:y2, x1:x2] = mask[y1:y2, x1:x2]
     return out
 
 
-# -------------------------
-# 2. Paint mask (adaptive)
-# -------------------------
-def compute_paint_mask(
-    image: np.ndarray,
-    mask: np.ndarray,
-    quantile: float = 0.4,
-    cut_top: float = 0.2,
-) -> np.ndarray:
+def cut_top_half(mask: np.ndarray) -> np.ndarray:
     """
-    Extract smooth (paint-like) regions using gradient quantile.
+    Keep only the lower half of a mask.
 
-    - keeps lowest-gradient pixels inside mask
-    - optionally removes top part (windshield heuristic)
+    Args:
+        mask:
+            Binary mask of shape (H, W).
+
+    Returns:
+        Mask of the same shape with the top half removed.
     """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    L = lab[..., 0]
-
-    gx = cv2.Sobel(L, cv2.CV_32F, 1, 0)
-    gy = cv2.Sobel(L, cv2.CV_32F, 0, 1)
-    grad = np.sqrt(gx * gx + gy * gy)
-
-    valid = mask > 0
-    thr = np.quantile(grad[valid], quantile)
-
-    paint = valid & (grad <= thr)
-
-    # cut top region (windshield suppression)
-    if cut_top > 0:
-        h = image.shape[0]
-        paint[: int(h * cut_top), :] = False
-
-    return paint
+    h = mask.shape[0]
+    out = mask.copy()
+    out[: h // 2, :] = 0
+    return out
 
 
-# -------------------------
-# 3. Histogram (a,b)
-# -------------------------
 def compute_color_histogram(
     image: np.ndarray,
-    paint_mask: np.ndarray,
+    mask: np.ndarray,
     bins: int = 16,
-    min_bin: float = 0.01,
 ) -> np.ndarray:
     """
-    Compute robust color histogram (Lab a,b) with small-bin suppression.
+    Compute a normalized 2D Lab (a,b) color histogram inside a mask.
+
+    Args:
+        image:
+            BGR uint8 image.
+        mask:
+            Binary mask of shape (H, W).
+        bins:
+            Number of bins per channel.
+
+    Returns:
+        Histogram of shape (bins, bins).
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     a = lab[..., 1]
     b = lab[..., 2]
 
-    a_vals = a[paint_mask]
-    b_vals = b[paint_mask]
+    valid = mask > 0
 
     hist, _, _ = np.histogram2d(
-        a_vals,
-        b_vals,
+        a[valid],
+        b[valid],
         bins=bins,
         range=[[0, 256], [0, 256]],
     )
 
     hist = hist.astype(np.float32)
     hist /= hist.sum() + 1e-6
-
-    # remove weak colors
-    hist[hist < min_bin] = 0
-    hist /= hist.sum() + 1e-6
-
     return hist
 
 
-# -------------------------
-# 4. Distance
-# -------------------------
 def compare_histograms(hist1: np.ndarray, hist2: np.ndarray) -> float:
     """
-    Bhattacharyya distance (0 = same, 1 = different)
+    Compare two histograms with Bhattacharyya distance.
+
+    Args:
+        hist1:
+            First histogram.
+        hist2:
+            Second histogram.
+
+    Returns:
+        Bhattacharyya distance.
     """
-    return cv2.compareHist(hist1, hist2, cv2.HISTCMP_BHATTACHARYYA)
+    return float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_BHATTACHARYYA))
 
 
-# -------------------------
-# 5. Visualization
-# -------------------------
-def plot_histograms(hist1: np.ndarray, hist2: np.ndarray):
+def plot_histograms(hist1: np.ndarray, hist2: np.ndarray) -> None:
     """
-    Show two histograms side by side with distance.
+    Plot two histograms side by side and show their distance.
+
+    Args:
+        hist1:
+            First histogram.
+        hist2:
+            Second histogram.
     """
     dist = compare_histograms(hist1, hist2)
 
@@ -124,25 +121,27 @@ def plot_histograms(hist1: np.ndarray, hist2: np.ndarray):
     axes[1].set_title("Hist 2")
     axes[1].axis("off")
 
-    plt.suptitle(f"Bhattacharyya distance: {dist:.3f}")
+    plt.suptitle(f"Bhattacharyya distance: {dist:.4f}")
     plt.tight_layout()
     plt.show()
 
-# crop
-mask1_c = crop_mask_by_points(mask1, pts1)
-mask2_c = crop_mask_by_points(mask2, pts2)
 
-# paint
-paint1 = compute_paint_mask(img1, mask1_c)
-paint2 = compute_paint_mask(img2, mask2_c)
 
-# hist
-h1 = compute_color_histogram(img1, paint1)
-h2 = compute_color_histogram(img2, paint2)
+# 1. Tight crop of masks by matched keypoints
+mask1_cropped = crop_mask_by_points(mask1, src_pts)
+mask2_cropped = crop_mask_by_points(mask2, dst_pts)
 
-# compare
-dist = compare_histograms(h1, h2)
-print(dist)
+# 2. Remove top half
+mask1_final = cut_top_half(mask1_cropped)
+mask2_final = cut_top_half(mask2_cropped)
 
-# visualize
-plot_histograms(h1, h2)
+# 3. Build histograms
+hist1 = compute_color_histogram(img1, mask1_final, bins=16)
+hist2 = compute_color_histogram(img2, mask2_final, bins=16)
+
+# 4. Compare
+dist = compare_histograms(hist1, hist2)
+print("distance:", dist)
+
+# 5. Visualize
+plot_histograms(hist1, hist2)
