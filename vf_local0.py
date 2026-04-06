@@ -482,3 +482,71 @@ def draw_regions_transfer(
 
     canvas = np.concatenate([left, right], axis=1)
     return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+
+# --- 1. Инициализация моделей ---
+device = "cuda"  # или "cpu"
+
+extractor, matcher = init_models(device=device)
+
+
+# --- 2. Поиск областей ---
+result = find_discriminative_patch_regions(
+    image1=img1,
+    mask1=mask1,
+    image2=img2,
+    mask2=mask2,
+    extractor=extractor,
+    matcher=matcher,
+    device=device,
+
+    # гиперпараметры
+    k=6,
+    size=56,
+    blur_ksize=9,
+    blur_sigma=2.0,
+    candidate_step=8,
+    shift_radius=12,
+    min_mask_coverage=0.90,
+    cross_weight=1.5,
+    max_iou=0.10,
+)
+
+
+# --- 3. Визуализация self-attention ---
+vis_self = draw_self_attention_points(
+    image=img1,
+    aug_image=result["aug1"],
+    src_pts=result["self_src_pts"],
+    dst_pts=result["self_dst_pts"],
+)
+
+# если в ноутбуке
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 5))
+plt.imshow(vis_self)
+plt.title("Self attention points")
+plt.axis("off")
+
+
+# --- 4. Визуализация выбранных областей ---
+vis_regions = draw_regions_transfer(
+    image1=img1,
+    image2=img2,
+    regions1=result["regions1"],
+    regions2=result["regions2"],
+)
+
+plt.figure(figsize=(10, 5))
+plt.imshow(vis_regions)
+plt.title("Selected regions and transfer")
+plt.axis("off")
+
+
+# --- 5. Посмотреть сами регионы ---
+for i, r in enumerate(result["regions1"]):
+    print(f"[{i}] score={r['score']:.2f} "
+          f"self={r['self_count']} "
+          f"cross={r['cross_count']}")
