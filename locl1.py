@@ -8,6 +8,29 @@ import matplotlib.pyplot as plt
 from romatch import roma_outdoor
 
 
+import cv2
+import numpy as np
+import torch
+
+def pad_to_multiple_of_14(img_rgb):
+    h, w = img_rgb.shape[:2]
+    new_h = ((h + 13) // 14) * 14
+    new_w = ((w + 13) // 14) * 14
+
+    pad_bottom = new_h - h
+    pad_right = new_w - w
+
+    img_pad = cv2.copyMakeBorder(
+        img_rgb,
+        top=0,
+        bottom=pad_bottom,
+        left=0,
+        right=pad_right,
+        borderType=cv2.BORDER_CONSTANT,
+        value=(0, 0, 0),
+    )
+    return img_pad, (h, w), (new_h, new_w)
+
 def load_rgb(path):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
