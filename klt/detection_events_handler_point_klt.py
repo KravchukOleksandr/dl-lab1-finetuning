@@ -66,19 +66,44 @@ class PointKLTDetectionEventsHandler(DetectionEventsHandler):
 
         self.point_klt_stats: PointKLTStats = self.person_tracker.stats
 
+        # Extra savings counters at the integration-handler level.
+        # PointKLTStats counts only frames actually submitted to PointKLT.
+        # motion_saved_frames counts frames skipped before PointKLT by FramesFilter.
+        self.motion_saved_frames = 0
+
     def process_frame(self, frame):
         self.frames_received += 1
 
         annotated_frame = frame.copy()
         motion_score = 1.0
 
-        # Important: do not skip PointKLT update entirely.
-        # Motion filter may be used only as overlay/stat signal here.
+        # Keep original FILTER_FRAMES behavior: if the ROI is static, skip all
+        # expensive processing for this frame. Important difference from the
+        # old handler: we do NOT extrapolate Tracklets here. We simply freeze
+        # the current event-layer state for this frame.
         if self.container_config.events_config.FILTER_FRAMES:
             motion_score = self.frames_filter.process_frame(frame.copy())
 
+            if motion_score < 0.00001:
+                self.motion_saved_frames += 1
+                self.frames_skipped += 1
+
+                # Same spirit as the original handler: on motion-skip we still
+                # draw the current known state/zones/overlay, but we do not call
+                # detection_zone.process_frame(...) with empty detections.
+                annotated_frame = self._annotate_frame(
+                    annotated_frame,
+                    [],
+                    self.tracklets,
+                    motion_score,
+                )
+                return annotated_frame, []
+
         events_tracklets = []
 
+        # PointKLT is now the person tracker. It is called on frames that pass
+        # the motion filter. It decides internally whether YOLO is needed or KLT
+        # is enough.
         person_detections, point_stats = self.person_tracker.update(frame=frame, allow_yolo=True)
         self.point_klt_stats = point_stats
 
@@ -92,7 +117,6 @@ class PointKLTDetectionEventsHandler(DetectionEventsHandler):
         self.tracklets = tracklets
 
         # Keep old PPE behavior for now. This may run legacy YOLO/ByteTrack if enabled.
-        # If PROCESS_PIZ is False, the new person tracker is the only heavy path.
         if self.container_config.events_config.PROCESS_PIZ:
             ppe_detections = self._track(frame=frame)
             events_tracklets_ppe = self.detection_ppe.process_frame(
@@ -103,10 +127,20 @@ class PointKLTDetectionEventsHandler(DetectionEventsHandler):
             )
             events_tracklets += events_tracklets_ppe
 
+        # Legacy counters are kept for compatibility, but the meaningful numbers
+        # are printed by _saving_counters().
         self.frames_processed = point_stats.yolo_runs
-        self.frames_skipped = max(0, self.frames_received - self.frames_processed)
+        self.frames_skipped = self.motion_saved_frames + max(0, point_stats.frames_received - point_stats.yolo_runs)
 
-        if events_tracklets or self.annotate_all_frames:
+        should_annotate = (
+            bool(events_tracklets)
+            or self.annotate_all_frames
+            or (self.point_klt_cfg.force_annotate_when_debug and (
+                self.point_klt_cfg.draw_debug_points or self.point_klt_cfg.draw_debug_status
+            ))
+        )
+
+        if should_annotate:
             annotated_frame = self._annotate_frame(
                 annotated_frame,
                 events_tracklets,
@@ -115,6 +149,39 @@ class PointKLTDetectionEventsHandler(DetectionEventsHandler):
             )
 
         return annotated_frame, events_tracklets
+
+    def _saving_counters(self):
+        stats = self.point_klt_stats
+
+        total_frames = self.frames_received
+        motion_saved = self.motion_saved_frames
+
+        # Frames that passed motion filter and were handled by PointKLT without YOLO.
+        klt_frames = stats.frames_received
+        klt_saved = max(0, klt_frames - stats.yolo_runs)
+
+        total_saved = motion_saved + klt_saved
+
+        def pct(x, denom):
+            if denom <= 0:
+                return 0.0
+            return 100.0 * x / denom
+
+        return {
+            "total_frames": total_frames,
+            "yolo_runs": stats.yolo_runs,
+            "student_runs": stats.student_runs,
+            "motion_saved": motion_saved,
+            "motion_saved_pct_total": pct(motion_saved, total_frames),
+            "klt_saved": klt_saved,
+            "klt_saved_pct_total": pct(klt_saved, total_frames),
+            "klt_saved_pct_klt_frames": pct(klt_saved, klt_frames),
+            "total_saved": total_saved,
+            "total_saved_pct": pct(total_saved, total_frames),
+            "klt_frames": klt_frames,
+            "active_tracks": stats.active_tracks,
+            "last_yolo_reason": stats.last_yolo_reason,
+        }
 
     def _annotate_frame(
         self,
@@ -125,6 +192,12 @@ class PointKLTDetectionEventsHandler(DetectionEventsHandler):
     ):
         annotated_frame = frame.copy()
 
+        # First draw the internal point-KLT state. This is debug-level tracker state,
+        # not event-level Tracklet state. It makes visible people outside zones and
+        # KLT points even if Tracklet.draw() would hide static/unconfirmed objects.
+        annotated_frame = self.person_tracker.draw_debug(annotated_frame)
+
+        # Then draw the existing event-level Tracklet overlay exactly like the old handler.
         for tracklet in tracklets.values():
             event_tracklet = tracklet in events_tracklets
             if event_tracklet or not tracklet.static or not tracklet.unconfirmed:
@@ -132,15 +205,17 @@ class PointKLTDetectionEventsHandler(DetectionEventsHandler):
 
         annotated_frame = self.danger_zones.draw(annotated_frame)
 
-        stats = self.point_klt_stats
+        c = self._saving_counters()
         current_time = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             + f"  motion_score: {motion_score:.7f}"
-            + f"  yolo: {stats.yolo_runs}/{stats.frames_received}"
-            + f"  saved: {stats.yolo_saved_frames} ({stats.yolo_saved_pct:.1f}%)"
-            + f"  student: {stats.student_runs}"
-            + f"  tracks: {stats.active_tracks}"
-            + f"  last_yolo: {stats.last_yolo_reason}"
+            + f"  yolo: {c['yolo_runs']}/{c['total_frames']}"
+            + f"  save_klt: {c['klt_saved']} ({c['klt_saved_pct_total']:.1f}%)"
+            + f"  save_motion: {c['motion_saved']} ({c['motion_saved_pct_total']:.1f}%)"
+            + f"  save_total: {c['total_saved']} ({c['total_saved_pct']:.1f}%)"
+            + f"  student: {c['student_runs']}"
+            + f"  tracks: {c['active_tracks']}"
+            + f"  last_yolo: {c['last_yolo_reason']}"
         )
 
         font = cv2.FONT_HERSHEY_SIMPLEX
