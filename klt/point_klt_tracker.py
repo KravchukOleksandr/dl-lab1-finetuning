@@ -234,6 +234,55 @@ class PointKLTPersonTracker:
 
         return self._to_detections(), self.stats
 
+
+    def draw_debug(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """
+        Draw internal PointKLT tracks directly from PointTrack state.
+        This is intentionally independent from Tracklet.draw(), because Tracklet may hide
+        static/unconfirmed/lost objects while we still need to debug tracker state.
+        """
+        if not (self.cfg.draw_debug_points or self.cfg.draw_debug_status):
+            return frame_bgr
+
+        out = frame_bgr.copy()
+        h, w = out.shape[:2]
+
+        for tr in self.tracks:
+            box = clip_box(tr.bbox, w, h)
+            x1, y1, x2, y2 = map(int, box)
+
+            if tr.needs_yolo:
+                color = (0, 0, 255)
+            elif tr.needs_refill:
+                color = (0, 165, 255)
+            else:
+                rng = np.random.default_rng(tr.track_id * 12345)
+                c = rng.integers(80, 255, size=3)
+                color = (int(c[0]), int(c[1]), int(c[2]))
+
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+
+            if self.cfg.draw_debug_status:
+                label = f"PKLT id {tr.track_id} pts {len(tr.points)} {tr.status}"
+                cv2.putText(
+                    out,
+                    label,
+                    (x1, max(15, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            if self.cfg.draw_debug_points and tr.points is not None:
+                for p in tr.points:
+                    px, py = int(round(float(p[0]))), int(round(float(p[1])))
+                    if 0 <= px < w and 0 <= py < h:
+                        cv2.circle(out, (px, py), 3, (0, 255, 0), -1)
+
+        return out
+
     def _to_detections(self) -> sv.Detections:
         tracks = [tr for tr in self.tracks if len(tr.points) >= self.cfg.min_points_for_klt]
         if not tracks:
