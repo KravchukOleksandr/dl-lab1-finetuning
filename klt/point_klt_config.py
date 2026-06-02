@@ -51,6 +51,11 @@ class PointKLTConfig:
     max_yolo_misses: int = 2
 
     # Debug/annotation
-    draw_debug_points: bool = False
-    draw_debug_status: bool = False
+    # Debug/annotation
+    # These are intentionally separate from the event-layer Tracklet drawing.
+    # They show the internal PointKLT state even when Tracklet is static, unconfirmed,
+    # outside a zone, or event annotation is disabled.
+    draw_debug_points: bool = True
+    draw_debug_status: bool = True
+    force_annotate_when_debug: bool = True
     log_every_n_frames: int = 300
