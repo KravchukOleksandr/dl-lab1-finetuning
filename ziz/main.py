@@ -1,23 +1,22 @@
 """
-Запуск обучения HelmetMicroNeXt.
+CLASS 0 = helmet     (каска есть)
+CLASS 1 = no_helmet  (каски нет, positive class)
 
-КЛАССЫ:
-    0 = helmet     — каска есть
-    1 = no_helmet  — каски нет
+Train:
+    WeightedRandomSampler, примерно 50/50.
+    BCEWithLogitsLoss без pos_weight.
 
-Положительный класс для precision, recall, F1, ROC-AUC и PR-AUC:
-    1 = no_helmet
+Validation:
+    sampler отсутствует;
+    каждый пример используется ровно один раз.
 
-Балансировка:
-    WeightedRandomSampler применяется только к train.
-    Validation проходит без sampler: каждый пример ровно один раз.
-
-AMP не используется.
-Batch-прогресс в лог не выводится.
+Выбор модели:
+    минимальный FPR при recall(no_helmet) >= 0.95.
 """
 
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
@@ -25,11 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
-    LinearLR,
-    SequentialLR,
-)
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import (
     DataLoader,
     WeightedRandomSampler,
@@ -51,24 +46,20 @@ from train import fit
 
 
 # =============================================================================
-# КОНФИГУРАЦИЯ
+# CONFIG
 # =============================================================================
-
-# -----------------------------------------------------------------------------
-# Пути
-# -----------------------------------------------------------------------------
 
 DATASET_ROOT = Path(
     r"./ziz-crops-202607-2"
 )
 
 OUTPUT_DIRECTORY = Path(
-    r"./runs/helmet_micronext_v1"
+    r"./runs/helmet_micronext_v2_ema_r95"
 )
 
 
 # -----------------------------------------------------------------------------
-# Вход модели и нормализация
+# Input
 # -----------------------------------------------------------------------------
 
 IMAGE_SIZE = 64
@@ -78,27 +69,23 @@ TRAIN_STD = DEFAULT_STD
 
 
 # -----------------------------------------------------------------------------
-# Геометрические аугментации
-#
-# Исходные файлы уже являются crop, расширенными примерно в 1.25 раза.
+# Geometry augmentation
 # -----------------------------------------------------------------------------
 
-# Размер случайного квадрата относительно максимального вписанного квадрата.
 SQUARE_SCALE = (
     0.90,
     1.00,
 )
 
-# Максимальный сдвиг центра относительно стороны максимального квадрата.
 CENTER_JITTER = 0.03
 
 HORIZONTAL_FLIP_PROBABILITY = 0.50
 
 
 # -----------------------------------------------------------------------------
-# Фотометрические аугментации
+# Photometric augmentation
 #
-# С вероятностью PHOTOMETRIC_PROBABILITY применяется ровно одна операция:
+# С вероятностью 0.5 применяется ровно одна операция:
 # brightness, contrast или gamma.
 # -----------------------------------------------------------------------------
 
@@ -114,139 +101,60 @@ GAMMA_RANGE = (
 
 
 # -----------------------------------------------------------------------------
-# Обучение
+# Training
 # -----------------------------------------------------------------------------
 
 SEED = 42
 
-EPOCHS = 80
-BATCH_SIZE = 64
+EPOCHS = 40
+BATCH_SIZE = 128
 NUM_WORKERS = 4
 
-BASE_LEARNING_RATE = 2.0e-3
+BASE_LEARNING_RATE = 1.0e-3
 MIN_LEARNING_RATE = 1.0e-5
 
-WARMUP_EPOCHS = 5
+WARMUP_EPOCHS = 3
 WARMUP_START_FACTOR = 0.20
 
 WEIGHT_DECAY = 1.0e-4
+
 MAX_GRAD_NORM = 5.0
 
+EMA_DECAY = 0.997
+
 
 # -----------------------------------------------------------------------------
-# Метрики и checkpoints
-#
-# Метрики precision, recall и F1 относятся к классу 1 = no_helmet.
-# Specificity и FPR характеризуют класс 0 = helmet.
+# Metrics and model selection
 # -----------------------------------------------------------------------------
 
+# Только для диагностических метрик.
+# Лучший рабочий threshold будет вычисляться автоматически.
 DECISION_THRESHOLD = 0.50
 
-# Доступные варианты:
-#     loss
-#     accuracy
-#     precision
-#     recall
-#     f1
-#     auc
-#     pr_auc
-#     specificity
-#     fpr
-BEST_METRIC = "auc"
+TARGET_RECALL = 0.95
 
-# None отключает early stopping.
-EARLY_STOPPING_PATIENCE = 20
+BEST_METRIC = "fpr_at_recall_95"
+
+# Проходим все 40 эпох.
+EARLY_STOPPING_PATIENCE = None
 
 
 # -----------------------------------------------------------------------------
-# DataLoader
+# Sampler and DataLoader
 # -----------------------------------------------------------------------------
+
+SAMPLER_REPLACEMENT = True
+
+# None означает len(train_dataset).
+TRAIN_SAMPLES_PER_EPOCH = None
 
 PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 
-# WeightedRandomSampler делает примерно равный вклад двух классов.
-# replacement=True означает, что изображения редкого класса могут
-# повторяться внутри одной эпохи.
-SAMPLER_REPLACEMENT = True
-
-# Количество выборок sampler за эпоху.
-# None означает len(train_dataset).
-TRAIN_SAMPLES_PER_EPOCH = None
-
-
-# -----------------------------------------------------------------------------
-# Воспроизводимость
-# -----------------------------------------------------------------------------
-
-CUDNN_DETERMINISTIC = True
-CUDNN_BENCHMARK = False
-
 
 # =============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# HELPERS
 # =============================================================================
-
-def validate_configuration() -> None:
-    if EPOCHS <= 0:
-        raise ValueError(
-            "EPOCHS must be positive"
-        )
-
-    if BATCH_SIZE <= 0:
-        raise ValueError(
-            "BATCH_SIZE must be positive"
-        )
-
-    if NUM_WORKERS < 0:
-        raise ValueError(
-            "NUM_WORKERS cannot be negative"
-        )
-
-    if BASE_LEARNING_RATE <= 0:
-        raise ValueError(
-            "BASE_LEARNING_RATE must be positive"
-        )
-
-    if MIN_LEARNING_RATE < 0:
-        raise ValueError(
-            "MIN_LEARNING_RATE cannot be negative"
-        )
-
-    if MIN_LEARNING_RATE > BASE_LEARNING_RATE:
-        raise ValueError(
-            "MIN_LEARNING_RATE cannot exceed "
-            "BASE_LEARNING_RATE"
-        )
-
-    if WARMUP_EPOCHS < 0:
-        raise ValueError(
-            "WARMUP_EPOCHS cannot be negative"
-        )
-
-    if WARMUP_EPOCHS >= EPOCHS:
-        raise ValueError(
-            "WARMUP_EPOCHS must be smaller than EPOCHS"
-        )
-
-    if not (
-        0.0
-        < WARMUP_START_FACTOR
-        <= 1.0
-    ):
-        raise ValueError(
-            "WARMUP_START_FACTOR must be in (0, 1]"
-        )
-
-    if not (
-        0.0
-        <= DECISION_THRESHOLD
-        <= 1.0
-    ):
-        raise ValueError(
-            "DECISION_THRESHOLD must be in [0, 1]"
-        )
-
 
 def set_global_seed(
     seed: int,
@@ -256,16 +164,10 @@ def set_global_seed(
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    torch.backends.cudnn.deterministic = (
-        CUDNN_DETERMINISTIC
-    )
-
-    torch.backends.cudnn.benchmark = (
-        CUDNN_BENCHMARK
-    )
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def seed_worker(
@@ -286,26 +188,19 @@ def build_balanced_sampler(
     dataset: HelmetFolderDataset,
 ) -> WeightedRandomSampler:
     """
-    Создаёт sampler с примерно равной суммарной вероятностью классов.
+    Каждое изображение получает вес:
 
-    Для каждого изображения:
-        weight = 1 / количество изображений его класса
+        1 / количество изображений его класса
 
-    Поэтому суммарный вес класса 0:
-        N0 * (1 / N0) = 1
-
-    И суммарный вес класса 1:
-        N1 * (1 / N1) = 1
+    Поэтому суммарный вес каждого класса равен примерно 1,
+    и sampler выбирает классы примерно 50/50.
     """
 
     counts = dataset.class_counts()
 
-    helmet_count = counts[0]
-    no_helmet_count = counts[1]
-
     if (
-        helmet_count <= 0
-        or no_helmet_count <= 0
+        counts[0] <= 0
+        or counts[1] <= 0
     ):
         raise RuntimeError(
             "Both train classes are required. "
@@ -313,8 +208,8 @@ def build_balanced_sampler(
         )
 
     class_weights = {
-        0: 1.0 / helmet_count,
-        1: 1.0 / no_helmet_count,
+        0: 1.0 / counts[0],
+        1: 1.0 / counts[1],
     }
 
     sample_weights = torch.tensor(
@@ -334,12 +229,17 @@ def build_balanced_sampler(
 
     if number_of_samples <= 0:
         raise ValueError(
-            "TRAIN_SAMPLES_PER_EPOCH "
-            "must be positive or None"
+            "TRAIN_SAMPLES_PER_EPOCH must "
+            "be positive or None"
         )
 
-    sampler_generator = torch.Generator()
-    sampler_generator.manual_seed(SEED)
+    sampler_generator = (
+        torch.Generator()
+    )
+
+    sampler_generator.manual_seed(
+        SEED
+    )
 
     return WeightedRandomSampler(
         weights=sample_weights,
@@ -351,88 +251,119 @@ def build_balanced_sampler(
 
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
-):
+) -> LambdaLR:
     """
-    Планировщик:
+    Epoch 1:
+        LR = 0.2 * BASE_LR
 
-        warmup:
-            BASE_LR * WARMUP_START_FACTOR
-            -> BASE_LR
+    Epoch 2:
+        LR = 0.6 * BASE_LR
 
-        затем:
-            cosine decay
-            -> MIN_LEARNING_RATE
+    Epoch 3:
+        LR = BASE_LR
 
-    scheduler.step() вызывается один раз после каждой эпохи в train.py.
+    Затем cosine decay до MIN_LR к эпохе 40.
+
+    Используется LambdaLR, поэтому предупреждения SequentialLR
+    из предыдущего запуска больше не будет.
     """
 
-    cosine_epochs = max(
-        1,
-        EPOCHS - WARMUP_EPOCHS,
+    minimum_factor = (
+        MIN_LEARNING_RATE
+        / BASE_LEARNING_RATE
     )
 
-    cosine_scheduler = CosineAnnealingLR(
-        optimizer=optimizer,
-        T_max=cosine_epochs,
-        eta_min=MIN_LEARNING_RATE,
+    cosine_epochs = (
+        EPOCHS
+        - WARMUP_EPOCHS
     )
 
-    if WARMUP_EPOCHS == 0:
-        return cosine_scheduler
+    def learning_rate_factor(
+        epoch_index: int,
+    ) -> float:
+        # LambdaLR использует zero-based index.
+        # epoch_index=0 соответствует первой эпохе.
 
-    warmup_scheduler = LinearLR(
-        optimizer=optimizer,
-        start_factor=WARMUP_START_FACTOR,
-        end_factor=1.0,
-        total_iters=WARMUP_EPOCHS,
+        if (
+            WARMUP_EPOCHS > 0
+            and epoch_index < WARMUP_EPOCHS
+        ):
+            if WARMUP_EPOCHS == 1:
+                return 1.0
+
+            progress = (
+                epoch_index
+                / (WARMUP_EPOCHS - 1)
+            )
+
+            return (
+                WARMUP_START_FACTOR
+                + (
+                    1.0
+                    - WARMUP_START_FACTOR
+                )
+                * progress
+            )
+
+        cosine_step = (
+            epoch_index
+            - WARMUP_EPOCHS
+            + 1
+        )
+
+        progress = (
+            cosine_step
+            / max(cosine_epochs, 1)
+        )
+
+        progress = min(
+            max(progress, 0.0),
+            1.0,
+        )
+
+        return (
+            minimum_factor
+            + 0.5
+            * (
+                1.0
+                - minimum_factor
+            )
+            * (
+                1.0
+                + math.cos(
+                    math.pi * progress
+                )
+            )
+        )
+
+    return LambdaLR(
+        optimizer,
+        lr_lambda=learning_rate_factor,
     )
 
-    return SequentialLR(
-        optimizer=optimizer,
-        schedulers=[
-            warmup_scheduler,
-            cosine_scheduler,
-        ],
-        milestones=[
-            WARMUP_EPOCHS,
-        ],
-    )
 
-
-def print_dataset_summary(
+def print_dataset(
     name: str,
     dataset: HelmetFolderDataset,
 ) -> dict[int, int]:
     counts = dataset.class_counts()
 
     print(
-        f"{name}: {len(dataset)} images"
+        f"{name}: "
+        f"{len(dataset)} images"
     )
 
     print(
-        f"  class 0 ({CLASS_NAMES[0]}): "
+        f"  class 0 "
+        f"({CLASS_NAMES[0]}): "
         f"{counts[0]}"
     )
 
     print(
-        f"  class 1 ({CLASS_NAMES[1]}): "
+        f"  class 1 "
+        f"({CLASS_NAMES[1]}): "
         f"{counts[1]}"
     )
-
-    if len(dataset) > 0:
-        helmet_fraction = (
-            counts[0] / len(dataset)
-        )
-
-        no_helmet_fraction = (
-            counts[1] / len(dataset)
-        )
-
-        print(
-            f"  class fractions: "
-            f"helmet={helmet_fraction:.4f}, "
-            f"no_helmet={no_helmet_fraction:.4f}"
-        )
 
     return counts
 
@@ -442,16 +373,47 @@ def print_dataset_summary(
 # =============================================================================
 
 def main() -> None:
-    validate_configuration()
+    expected_metric = (
+        "fpr_at_recall_"
+        f"{int(round(TARGET_RECALL * 100))}"
+    )
+
+    if BEST_METRIC != expected_metric:
+        raise ValueError(
+            f"Set BEST_METRIC="
+            f"{expected_metric!r}"
+        )
+
+    if not (
+        0 <= WARMUP_EPOCHS < EPOCHS
+    ):
+        raise ValueError(
+            "WARMUP_EPOCHS must be "
+            "in [0, EPOCHS)"
+        )
+
+    if not (
+        0.0 < TARGET_RECALL <= 1.0
+    ):
+        raise ValueError(
+            "TARGET_RECALL must be in (0, 1]"
+        )
+
     set_global_seed(SEED)
 
     print("=" * 78)
-    print("HelmetMicroNeXt binary classification")
-    print("CLASS 0 = helmet     = каска есть")
+
     print(
-        "CLASS 1 = no_helmet  = каски нет "
+        "CLASS 0 = helmet     "
+        "= каска есть"
+    )
+
+    print(
+        "CLASS 1 = no_helmet  "
+        "= каски нет "
         "(positive class)"
     )
+
     print("=" * 78)
 
     print(
@@ -465,8 +427,8 @@ def main() -> None:
     )
 
     print(
-        "train.py version: "
-        f"{getattr(train_module, 'TRAIN_MODULE_VERSION', 'unknown')}"
+        f"train.py version: "
+        f"{train_module.TRAIN_MODULE_VERSION}"
     )
 
     print()
@@ -506,8 +468,12 @@ def main() -> None:
         photometric_probability=(
             PHOTOMETRIC_PROBABILITY
         ),
-        brightness_limit=BRIGHTNESS_LIMIT,
-        contrast_limit=CONTRAST_LIMIT,
+        brightness_limit=(
+            BRIGHTNESS_LIMIT
+        ),
+        contrast_limit=(
+            CONTRAST_LIMIT
+        ),
         gamma_range=GAMMA_RANGE,
     )
 
@@ -519,64 +485,36 @@ def main() -> None:
     )
 
     train_dataset = HelmetFolderDataset(
-        split_directory=train_directory,
-        preprocessor=train_preprocessor,
+        train_directory,
+        train_preprocessor,
     )
 
     val_dataset = HelmetFolderDataset(
-        split_directory=val_directory,
-        preprocessor=val_preprocessor,
+        val_directory,
+        val_preprocessor,
     )
 
-    train_counts = print_dataset_summary(
+    train_counts = print_dataset(
         "Train",
         train_dataset,
     )
 
-    val_counts = print_dataset_summary(
+    val_counts = print_dataset(
         "Validation",
         val_dataset,
     )
 
     if (
-        val_counts[0] == 0
-        or val_counts[1] == 0
+        val_counts[0] <= 0
+        or val_counts[1] <= 0
     ):
         raise RuntimeError(
-            "Validation must contain both classes "
-            "for ROC-AUC and PR-AUC calculation."
+            "Validation must contain "
+            "both classes"
         )
 
-    print(
-        f"Input mean RGB: "
-        f"{list(TRAIN_MEAN)}"
-    )
-
-    print(
-        f"Input std  RGB: "
-        f"{list(TRAIN_STD)}"
-    )
-
-    print()
-
-    train_sampler = build_balanced_sampler(
+    sampler = build_balanced_sampler(
         train_dataset
-    )
-
-    train_loader_generator = (
-        torch.Generator()
-    )
-
-    train_loader_generator.manual_seed(
-        SEED
-    )
-
-    val_loader_generator = (
-        torch.Generator()
-    )
-
-    val_loader_generator.manual_seed(
-        SEED + 1
     )
 
     effective_pin_memory = (
@@ -589,21 +527,42 @@ def main() -> None:
         and NUM_WORKERS > 0
     )
 
+    train_generator = (
+        torch.Generator()
+    )
+
+    train_generator.manual_seed(
+        SEED
+    )
+
+    val_generator = (
+        torch.Generator()
+    )
+
+    val_generator.manual_seed(
+        SEED + 1
+    )
+
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=BATCH_SIZE,
 
-        # Балансировка применяется только здесь.
-        sampler=train_sampler,
+        sampler=sampler,
         shuffle=False,
 
         num_workers=NUM_WORKERS,
-        pin_memory=effective_pin_memory,
+
+        pin_memory=(
+            effective_pin_memory
+        ),
+
         persistent_workers=(
             effective_persistent_workers
         ),
+
         worker_init_fn=seed_worker,
-        generator=train_loader_generator,
+        generator=train_generator,
+
         drop_last=False,
     )
 
@@ -611,17 +570,22 @@ def main() -> None:
         dataset=val_dataset,
         batch_size=BATCH_SIZE,
 
-        # Validation не балансируется.
         sampler=None,
         shuffle=False,
 
         num_workers=NUM_WORKERS,
-        pin_memory=effective_pin_memory,
+
+        pin_memory=(
+            effective_pin_memory
+        ),
+
         persistent_workers=(
             effective_persistent_workers
         ),
+
         worker_init_fn=seed_worker,
-        generator=val_loader_generator,
+        generator=val_generator,
+
         drop_last=False,
     )
 
@@ -638,7 +602,7 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss()
 
     optimizer = AdamW(
-        params=model.parameters(),
+        model.parameters(),
         lr=BASE_LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
@@ -647,11 +611,10 @@ def main() -> None:
         optimizer
     )
 
-    train_samples_per_epoch = len(
-        train_sampler
+    print(
+        f"Device: "
+        f"{device}"
     )
-
-    print(f"Device: {device}")
 
     if device.type == "cuda":
         print(
@@ -675,99 +638,87 @@ def main() -> None:
     )
 
     print(
-        f"Train samples per epoch: "
-        f"{train_samples_per_epoch}"
+        f"Samples per train epoch: "
+        f"{len(sampler)}"
     )
 
     print(
         "Train sampler: "
-        "WeightedRandomSampler, "
-        f"replacement={SAMPLER_REPLACEMENT}, "
-        "expected class contribution ≈ 50/50"
+        "WeightedRandomSampler (~50/50)"
     )
 
     print(
-        "Validation sampler: disabled, "
-        "each validation image is used once"
+        "Validation sampler: disabled"
     )
 
     print(
-        "Loss: BCEWithLogitsLoss, "
+        "Loss: BCEWithLogitsLoss "
         "without pos_weight"
     )
 
     print(
-        f"Base learning rate: "
-        f"{BASE_LEARNING_RATE:.3e}"
+        f"LR: "
+        f"{BASE_LEARNING_RATE:.3e} "
+        f"-> {MIN_LEARNING_RATE:.3e}"
     )
 
     print(
-        f"Warmup epochs: "
-        f"{WARMUP_EPOCHS}"
+        f"Warmup: "
+        f"{WARMUP_EPOCHS} epochs"
     )
 
     print(
-        f"Warmup start factor: "
-        f"{WARMUP_START_FACTOR:.2f}"
+        f"EMA decay: "
+        f"{EMA_DECAY}"
     )
 
     print(
-        f"Minimum learning rate: "
-        f"{MIN_LEARNING_RATE:.3e}"
+        "Selection: minimum FPR "
+        f"with recall >= {TARGET_RECALL:.2f}"
     )
 
     print(
-        f"Weight decay: "
-        f"{WEIGHT_DECAY:.3e}"
-    )
-
-    print(
-        f"Decision threshold: "
-        f"{DECISION_THRESHOLD:.3f}"
-    )
-
-    print(
-        f"Best checkpoint metric: "
-        f"val_{BEST_METRIC}"
-    )
-
-    print(
-        f"Output directory: "
+        f"Output: "
         f"{OUTPUT_DIRECTORY.resolve()}"
     )
 
     print()
 
-    config_for_checkpoint = {
+    config = {
         "dataset_root": str(
             DATASET_ROOT.resolve()
-        ),
-        "output_directory": str(
-            OUTPUT_DIRECTORY.resolve()
         ),
 
         "class_0": "helmet",
         "class_1": "no_helmet",
         "positive_class": 1,
 
-        "train_class_counts": {
-            0: train_counts[0],
-            1: train_counts[1],
-        },
+        "train_class_counts": (
+            train_counts
+        ),
 
-        "val_class_counts": {
-            0: val_counts[0],
-            1: val_counts[1],
-        },
+        "val_class_counts": (
+            val_counts
+        ),
 
         "image_size": IMAGE_SIZE,
-        "train_mean": list(TRAIN_MEAN),
-        "train_std": list(TRAIN_STD),
+
+        "train_mean": list(
+            TRAIN_MEAN
+        ),
+
+        "train_std": list(
+            TRAIN_STD
+        ),
 
         "square_scale": list(
             SQUARE_SCALE
         ),
-        "center_jitter": CENTER_JITTER,
+
+        "center_jitter": (
+            CENTER_JITTER
+        ),
+
         "horizontal_flip_probability": (
             HORIZONTAL_FLIP_PROBABILITY
         ),
@@ -775,12 +726,15 @@ def main() -> None:
         "photometric_probability": (
             PHOTOMETRIC_PROBABILITY
         ),
+
         "brightness_limit": (
             BRIGHTNESS_LIMIT
         ),
+
         "contrast_limit": (
             CONTRAST_LIMIT
         ),
+
         "gamma_range": list(
             GAMMA_RANGE
         ),
@@ -793,34 +747,53 @@ def main() -> None:
         "base_learning_rate": (
             BASE_LEARNING_RATE
         ),
+
         "minimum_learning_rate": (
             MIN_LEARNING_RATE
         ),
+
         "warmup_epochs": (
             WARMUP_EPOCHS
         ),
+
         "warmup_start_factor": (
             WARMUP_START_FACTOR
         ),
-        "weight_decay": WEIGHT_DECAY,
-        "max_grad_norm": MAX_GRAD_NORM,
+
+        "weight_decay": (
+            WEIGHT_DECAY
+        ),
+
+        "max_grad_norm": (
+            MAX_GRAD_NORM
+        ),
+
+        "ema_decay": (
+            EMA_DECAY
+        ),
 
         "decision_threshold": (
             DECISION_THRESHOLD
         ),
-        "best_metric": BEST_METRIC,
-        "early_stopping_patience": (
-            EARLY_STOPPING_PATIENCE
+
+        "target_recall": (
+            TARGET_RECALL
+        ),
+
+        "best_metric": (
+            BEST_METRIC
         ),
 
         "sampler": (
             "WeightedRandomSampler"
         ),
+
         "sampler_replacement": (
             SAMPLER_REPLACEMENT
         ),
+
         "train_samples_per_epoch": (
-            train_samples_per_epoch
+            len(sampler)
         ),
 
         "amp": False,
@@ -828,21 +801,45 @@ def main() -> None:
 
     fit(
         model=model,
+
         train_loader=train_loader,
         val_loader=val_loader,
+
         criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
+
         device=device,
+
         epochs=EPOCHS,
-        output_directory=OUTPUT_DIRECTORY,
-        max_grad_norm=MAX_GRAD_NORM,
-        threshold=DECISION_THRESHOLD,
-        best_metric=BEST_METRIC,
+
+        output_directory=(
+            OUTPUT_DIRECTORY
+        ),
+
+        ema_decay=EMA_DECAY,
+
+        target_recall=(
+            TARGET_RECALL
+        ),
+
+        max_grad_norm=(
+            MAX_GRAD_NORM
+        ),
+
+        threshold=(
+            DECISION_THRESHOLD
+        ),
+
+        best_metric=(
+            BEST_METRIC
+        ),
+
         early_stopping_patience=(
             EARLY_STOPPING_PATIENCE
         ),
-        extra_config=config_for_checkpoint,
+
+        extra_config=config,
     )
 
 
