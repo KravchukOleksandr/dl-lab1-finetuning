@@ -1,18 +1,16 @@
 """
-Классы:
-    0 = helmet     — каска есть
-    1 = no_helmet  — каски нет, положительный класс
+CLASS 0 = helmet     (каска есть)
+CLASS 1 = no_helmet  (каски нет, positive class)
 
-Precision, recall, F1 и PR-AUC относятся к классу 1 = no_helmet.
+Train balancing is configured in main.py.
+Validation is never resampled.
 
-Specificity и FPR характеризуют ошибки на классе 0 = helmet.
-
-Validation не балансируется:
-каждый validation-пример проходит ровно один раз.
+AMP and batch-level logging are intentionally disabled.
 """
 
 from __future__ import annotations
 
+import copy
 import csv
 import math
 import time
@@ -30,11 +28,163 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 from torch.utils.data import DataLoader
 
 
-TRAIN_MODULE_VERSION = "fp32-epoch-log-v4"
+TRAIN_MODULE_VERSION = "ema-r95-fp32-v5"
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average модели.
+
+    EMA применяется:
+        - после каждого optimizer.step();
+        - для validation;
+        - для выбора лучшей эпохи;
+        - для model_state_dict в checkpoint.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.997,
+    ) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError(
+                "EMA_DECAY must be in (0, 1)"
+            )
+
+        self.decay = float(decay)
+
+        self.module = copy.deepcopy(
+            model
+        ).eval()
+
+        self.module.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(
+        self,
+        model: nn.Module,
+    ) -> None:
+        ema_state = self.module.state_dict()
+        model_state = model.state_dict()
+
+        for name, ema_value in ema_state.items():
+            model_value = model_state[name].detach()
+
+            if torch.is_floating_point(
+                ema_value
+            ):
+                ema_value.mul_(
+                    self.decay
+                ).add_(
+                    model_value,
+                    alpha=1.0 - self.decay,
+                )
+            else:
+                # Например BatchNorm.num_batches_tracked.
+                ema_value.copy_(model_value)
+
+
+def operating_point(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    target_recall: float,
+) -> dict[str, float | int]:
+    """
+    Находит минимальный FPR среди всех порогов,
+    обеспечивающих recall >= target_recall.
+
+    При равном FPR:
+        1. выбирается больший recall;
+        2. затем более высокий threshold.
+    """
+
+    fpr_values, recall_values, thresholds = (
+        roc_curve(
+            y_true,
+            y_prob,
+            pos_label=1,
+            drop_intermediate=False,
+        )
+    )
+
+    valid_indices = np.flatnonzero(
+        recall_values >= target_recall
+    )
+
+    if valid_indices.size == 0:
+        raise RuntimeError(
+            f"Target recall {target_recall:.4f} "
+            "is unreachable"
+        )
+
+    minimum_fpr = np.min(
+        fpr_values[valid_indices]
+    )
+
+    candidates = valid_indices[
+        np.isclose(
+            fpr_values[valid_indices],
+            minimum_fpr,
+            atol=1e-12,
+            rtol=0.0,
+        )
+    ]
+
+    maximum_recall = np.max(
+        recall_values[candidates]
+    )
+
+    candidates = candidates[
+        np.isclose(
+            recall_values[candidates],
+            maximum_recall,
+            atol=1e-12,
+            rtol=0.0,
+        )
+    ]
+
+    best_index = int(
+        candidates[
+            np.argmax(
+                thresholds[candidates]
+            )
+        ]
+    )
+
+    threshold = float(
+        thresholds[best_index]
+    )
+
+    y_pred = (
+        y_prob >= threshold
+    ).astype(np.int64)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+    ).ravel()
+
+    recall = tp / max(tp + fn, 1)
+    fpr = fp / max(fp + tn, 1)
+    precision = tp / max(tp + fp, 1)
+
+    return {
+        "fpr": float(fpr),
+        "recall": float(recall),
+        "precision": float(precision),
+        "threshold": threshold,
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
 
 
 def calculate_metrics(
@@ -42,10 +192,13 @@ def calculate_metrics(
     probabilities: list[float],
     loss: float,
     threshold: float,
+    target_recall: float,
 ) -> dict[str, float | int]:
     """
-    Положительный класс:
-        1 = no_helmet
+    Обычные метрики считаются при фиксированном threshold.
+
+    Дополнительно рассчитывается рабочая точка:
+        минимальный FPR при recall >= target_recall.
     """
 
     y_true = np.asarray(
@@ -68,15 +221,6 @@ def calculate_metrics(
         labels=[0, 1],
     ).ravel()
 
-    helmet_count = tn + fp
-
-    if helmet_count > 0:
-        specificity = tn / helmet_count
-        fpr = fp / helmet_count
-    else:
-        specificity = 0.0
-        fpr = 0.0
-
     try:
         auc = float(
             roc_auc_score(
@@ -84,11 +228,7 @@ def calculate_metrics(
                 y_prob,
             )
         )
-    except ValueError:
-        auc = float("nan")
 
-    try:
-        # Average Precision — стандартная оценка PR-кривой.
         pr_auc = float(
             average_precision_score(
                 y_true,
@@ -96,12 +236,24 @@ def calculate_metrics(
             )
         )
     except ValueError:
+        auc = float("nan")
         pr_auc = float("nan")
 
-    return {
+    fpr = fp / max(fp + tn, 1)
+
+    target_tag = int(
+        round(target_recall * 100)
+    )
+
+    point = operating_point(
+        y_true=y_true,
+        y_prob=y_prob,
+        target_recall=target_recall,
+    )
+
+    metrics: dict[str, float | int] = {
         "loss": float(loss),
 
-        # Общая метрика по двум классам.
         "accuracy": float(
             accuracy_score(
                 y_true,
@@ -109,7 +261,7 @@ def calculate_metrics(
             )
         ),
 
-        # Метрики положительного класса 1 = no_helmet.
+        # Для класса 1 = no_helmet.
         "precision": float(
             precision_score(
                 y_true,
@@ -118,6 +270,7 @@ def calculate_metrics(
                 zero_division=0,
             )
         ),
+
         "recall": float(
             recall_score(
                 y_true,
@@ -126,6 +279,7 @@ def calculate_metrics(
                 zero_division=0,
             )
         ),
+
         "f1": float(
             f1_score(
                 y_true,
@@ -135,20 +289,29 @@ def calculate_metrics(
             )
         ),
 
-        # Метрики ранжирования, не зависящие от threshold.
         "auc": auc,
         "pr_auc": pr_auc,
 
-        # Поведение на классе 0 = helmet.
-        "specificity": float(specificity),
+        # Для класса 0 = helmet.
+        "specificity": float(
+            1.0 - fpr
+        ),
+
         "fpr": float(fpr),
 
-        # Полная confusion matrix.
+        # Confusion matrix при фиксированном threshold.
         "tn": int(tn),
         "fp": int(fp),
         "fn": int(fn),
         "tp": int(tp),
     }
+
+    for key, value in point.items():
+        metrics[
+            f"{key}_at_recall_{target_tag}"
+        ] = value
+
+    return metrics
 
 
 def run_epoch(
@@ -157,17 +320,23 @@ def run_epoch(
     criterion: nn.Module,
     device: torch.device,
     threshold: float,
+    target_recall: float,
     optimizer: torch.optim.Optimizer | None = None,
+    ema: ModelEMA | None = None,
     max_grad_norm: float | None = None,
 ) -> dict[str, float | int]:
     """
-    Если optimizer передан — train.
-    Если optimizer=None — validation.
+    optimizer передан:
+        train
 
-    Прогресс по batch не печатается.
+    optimizer=None:
+        validation
+
+    Никакого вывода внутри batch-loop нет.
     """
 
     training = optimizer is not None
+
     model.train(training)
 
     total_loss = 0.0
@@ -189,12 +358,15 @@ def run_epoch(
 
         if training:
             optimizer.zero_grad(
-                set_to_none=True,
+                set_to_none=True
             )
 
-        # AMP и autocast намеренно не используются.
-        with torch.set_grad_enabled(training):
-            logits = model(images).reshape(-1)
+        with torch.set_grad_enabled(
+            training
+        ):
+            logits = model(
+                images
+            ).reshape(-1)
 
             loss = criterion(
                 logits,
@@ -214,6 +386,9 @@ def run_epoch(
                     )
 
                 optimizer.step()
+
+                if ema is not None:
+                    ema.update(model)
 
         batch_size = labels.numel()
 
@@ -251,25 +426,111 @@ def run_epoch(
         probabilities=probabilities,
         loss=average_loss,
         threshold=threshold,
+        target_recall=target_recall,
     )
 
 
-def metric_is_better(
-    current: float,
-    best: float,
-    metric_name: str,
+def is_better(
+    current: dict[str, float | int],
+    best: dict[str, float | int] | None,
+    metric: str,
+    target_recall: float,
 ) -> bool:
-    if math.isnan(current):
+    """
+    Основной порядок сравнения для FPR@R95:
+
+        1. ниже FPR;
+        2. выше фактический recall;
+        3. выше ROC-AUC;
+        4. выше threshold.
+    """
+
+    if best is None:
+        return True
+
+    current_value = float(
+        current[metric]
+    )
+
+    best_value = float(
+        best[metric]
+    )
+
+    if math.isnan(current_value):
         return False
 
-    # Для loss и FPR меньше — лучше.
-    if metric_name in {
+    target_tag = int(
+        round(target_recall * 100)
+    )
+
+    target_metric = (
+        f"fpr_at_recall_{target_tag}"
+    )
+
+    if metric == target_metric:
+        epsilon = 1e-12
+
+        current_rank = (
+            current_value,
+
+            -float(
+                current[
+                    f"recall_at_recall_{target_tag}"
+                ]
+            ),
+
+            -float(current["auc"]),
+
+            -float(
+                current[
+                    f"threshold_at_recall_{target_tag}"
+                ]
+            ),
+        )
+
+        best_rank = (
+            best_value,
+
+            -float(
+                best[
+                    f"recall_at_recall_{target_tag}"
+                ]
+            ),
+
+            -float(best["auc"]),
+
+            -float(
+                best[
+                    f"threshold_at_recall_{target_tag}"
+                ]
+            ),
+        )
+
+        for current_item, best_item in zip(
+            current_rank,
+            best_rank,
+        ):
+            if (
+                current_item
+                < best_item - epsilon
+            ):
+                return True
+
+            if (
+                current_item
+                > best_item + epsilon
+            ):
+                return False
+
+        return False
+
+    if metric in {
         "loss",
         "fpr",
     }:
-        return current < best
+        return current_value < best_value
 
-    return current > best
+    return current_value > best_value
 
 
 def format_metrics(
@@ -288,6 +549,34 @@ def format_metrics(
     )
 
 
+def format_target_metrics(
+    metrics: dict[str, float | int],
+    target_recall: float,
+) -> str:
+    tag = int(
+        round(target_recall * 100)
+    )
+
+    return (
+        f"FPR@R{tag}="
+        f"{metrics[f'fpr_at_recall_{tag}']:.4f} | "
+
+        f"recall="
+        f"{metrics[f'recall_at_recall_{tag}']:.4f} | "
+
+        f"precision="
+        f"{metrics[f'precision_at_recall_{tag}']:.4f} | "
+
+        f"threshold="
+        f"{metrics[f'threshold_at_recall_{tag}']:.6f} | "
+
+        f"TN={metrics[f'tn_at_recall_{tag}']} "
+        f"FP={metrics[f'fp_at_recall_{tag}']} "
+        f"FN={metrics[f'fn_at_recall_{tag}']} "
+        f"TP={metrics[f'tp_at_recall_{tag}']}"
+    )
+
+
 def append_history(
     path: Path,
     row: dict[str, Any],
@@ -301,7 +590,9 @@ def append_history(
     ) as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=list(row.keys()),
+            fieldnames=list(
+                row.keys()
+            ),
         )
 
         if new_file:
@@ -313,23 +604,41 @@ def append_history(
 def save_checkpoint(
     path: Path,
     model: nn.Module,
+    ema: ModelEMA,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     epoch: int,
     best_epoch: int,
     best_metric: str,
-    best_value: float,
+    best_metrics: dict[str, float | int],
     train_metrics: dict[str, float | int],
     val_metrics: dict[str, float | int],
     config: dict[str, Any],
 ) -> None:
+    """
+    model_state_dict содержит EMA-веса,
+    предназначенные для inference.
+
+    raw_model_state_dict содержит обычные веса,
+    обновляемые optimizer.
+    """
+
     checkpoint = {
         "epoch": epoch,
         "best_epoch": best_epoch,
-        "best_metric": best_metric,
-        "best_value": best_value,
 
+        "best_metric": best_metric,
+        "best_value": float(
+            best_metrics[best_metric]
+        ),
+
+        # Использовать для inference.
         "model_state_dict": (
+            ema.module.state_dict()
+        ),
+
+        # Сырые веса optimizer-модели.
+        "raw_model_state_dict": (
             model.state_dict()
         ),
 
@@ -345,6 +654,8 @@ def save_checkpoint(
 
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
+        "best_val_metrics": best_metrics,
+
         "config": config,
 
         "class_mapping": {
@@ -374,28 +685,26 @@ def fit(
     device: torch.device,
     epochs: int,
     output_directory: str | Path,
+    ema_decay: float,
+    target_recall: float,
     max_grad_norm: float | None = 5.0,
     threshold: float = 0.5,
-    best_metric: str = "auc",
-    early_stopping_patience: int | None = 20,
+    best_metric: str = "fpr_at_recall_95",
+    early_stopping_patience: int | None = None,
     extra_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    allowed_metrics = {
-        "loss",
-        "accuracy",
-        "precision",
-        "recall",
-        "f1",
-        "auc",
-        "pr_auc",
-        "specificity",
-        "fpr",
-    }
+    target_tag = int(
+        round(target_recall * 100)
+    )
 
-    if best_metric not in allowed_metrics:
+    expected_metric = (
+        f"fpr_at_recall_{target_tag}"
+    )
+
+    if best_metric != expected_metric:
         raise ValueError(
-            f"Unknown BEST_METRIC={best_metric!r}. "
-            f"Allowed: {sorted(allowed_metrics)}"
+            f"For target_recall={target_recall}, "
+            f"use best_metric={expected_metric!r}"
         )
 
     output_directory = Path(
@@ -412,31 +721,32 @@ def fit(
         / "history.csv"
     )
 
-    best_checkpoint_path = (
+    best_path = (
         output_directory
         / "best.pt"
     )
 
-    last_checkpoint_path = (
+    last_path = (
         output_directory
         / "last.pt"
     )
 
-    # Новый запуск создаёт новую историю.
     if history_path.exists():
         history_path.unlink()
 
-    if best_metric in {
-        "loss",
-        "fpr",
-    }:
-        best_value = math.inf
-    else:
-        best_value = -math.inf
+    ema = ModelEMA(
+        model,
+        decay=ema_decay,
+    )
+
+    best_metrics: (
+        dict[str, float | int] | None
+    ) = None
 
     best_epoch = 0
-    epochs_without_improvement = 0
-    training_started = time.perf_counter()
+    stale_epochs = 0
+
+    started = time.perf_counter()
 
     config = dict(
         extra_config or {}
@@ -454,13 +764,14 @@ def fit(
     )
 
     print(
-        f"Best checkpoint metric: "
-        f"val_{best_metric}"
+        "Selection: minimum val FPR "
+        f"with recall >= {target_recall:.2f}"
     )
 
     print(
-        "AMP: disabled | "
-        "batch progress: disabled"
+        f"EMA={ema_decay:.4f} | "
+        "AMP disabled | "
+        "batch logging disabled"
     )
 
     print()
@@ -483,41 +794,43 @@ def fit(
             criterion=criterion,
             device=device,
             threshold=threshold,
+            target_recall=target_recall,
             optimizer=optimizer,
+            ema=ema,
             max_grad_norm=max_grad_norm,
         )
 
+        # Validation выполняется на EMA-модели.
         val_metrics = run_epoch(
-            model=model,
+            model=ema.module,
             loader=val_loader,
             criterion=criterion,
             device=device,
             threshold=threshold,
+            target_recall=target_recall,
             optimizer=None,
+            ema=None,
             max_grad_norm=None,
         )
 
-        current_value = float(
-            val_metrics[best_metric]
-        )
-
-        improved = metric_is_better(
-            current=current_value,
-            best=best_value,
-            metric_name=best_metric,
+        improved = is_better(
+            current=val_metrics,
+            best=best_metrics,
+            metric=best_metric,
+            target_recall=target_recall,
         )
 
         if improved:
-            best_value = current_value
+            best_metrics = dict(
+                val_metrics
+            )
+
             best_epoch = epoch
-            epochs_without_improvement = 0
+            stale_epochs = 0
         else:
-            epochs_without_improvement += 1
+            stale_epochs += 1
 
-        if scheduler is not None:
-            scheduler.step()
-
-        epoch_seconds = (
+        seconds = (
             time.perf_counter()
             - epoch_started
         )
@@ -525,7 +838,7 @@ def fit(
         history_row: dict[str, Any] = {
             "epoch": epoch,
             "lr": learning_rate,
-            "seconds": epoch_seconds,
+            "seconds": seconds,
         }
 
         history_row.update({
@@ -545,21 +858,26 @@ def fit(
             history_row,
         )
 
+        assert best_metrics is not None
+
         checkpoint_config = {
             **config,
+            "target_recall": target_recall,
             "threshold": threshold,
             "best_metric": best_metric,
+            "ema_decay": ema_decay,
         }
 
         save_checkpoint(
-            path=last_checkpoint_path,
+            path=last_path,
             model=model,
+            ema=ema,
             optimizer=optimizer,
             scheduler=scheduler,
             epoch=epoch,
             best_epoch=best_epoch,
             best_metric=best_metric,
-            best_value=best_value,
+            best_metrics=best_metrics,
             train_metrics=train_metrics,
             val_metrics=val_metrics,
             config=checkpoint_config,
@@ -567,20 +885,21 @@ def fit(
 
         if improved:
             save_checkpoint(
-                path=best_checkpoint_path,
+                path=best_path,
                 model=model,
+                ema=ema,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 epoch=epoch,
                 best_epoch=best_epoch,
                 best_metric=best_metric,
-                best_value=best_value,
+                best_metrics=best_metrics,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
                 config=checkpoint_config,
             )
 
-        best_marker = (
+        marker = (
             " <-- BEST"
             if improved
             else ""
@@ -589,52 +908,69 @@ def fit(
         print(
             f"Epoch {epoch:03d}/{epochs:03d} | "
             f"lr={learning_rate:.3e} | "
-            f"time={epoch_seconds:.1f}s"
-            f"{best_marker}"
+            f"time={seconds:.1f}s"
+            f"{marker}"
         )
 
         print(
-            f"  train: "
+            f"  train:   "
             f"{format_metrics(train_metrics)}"
         )
 
         print(
-            f"  val:   "
+            f"  val EMA: "
             f"{format_metrics(val_metrics)}"
         )
 
         print(
-            "  val confusion: "
+            "  val @ fixed threshold: "
             f"TN={val_metrics['tn']} "
             f"FP={val_metrics['fp']} "
             f"FN={val_metrics['fn']} "
-            f"TP={val_metrics['tp']} | "
-            f"best epoch={best_epoch:03d}, "
-            f"val_{best_metric}="
-            f"{best_value:.4f}"
+            f"TP={val_metrics['tp']}"
+        )
+
+        print(
+            f"  val EMA: "
+            f"{format_target_metrics(val_metrics, target_recall)}"
+        )
+
+        print(
+            f"  best: epoch={best_epoch:03d} | "
+            f"{best_metric}="
+            f"{float(best_metrics[best_metric]):.4f}"
         )
 
         print()
 
+        if scheduler is not None:
+            scheduler.step()
+
         if (
             early_stopping_patience is not None
             and early_stopping_patience > 0
-            and epochs_without_improvement
+            and stale_epochs
             >= early_stopping_patience
         ):
             print(
-                "Early stopping: "
-                f"val_{best_metric} "
-                "did not improve for "
-                f"{early_stopping_patience} "
-                "epochs."
+                "Early stopping after "
+                f"{stale_epochs} epochs "
+                "without improvement"
             )
             break
 
     total_minutes = (
         time.perf_counter()
-        - training_started
+        - started
     ) / 60.0
+
+    assert best_metrics is not None
+
+    best_threshold = float(
+        best_metrics[
+            f"threshold_at_recall_{target_tag}"
+        ]
+    )
 
     print(
         f"Training finished in "
@@ -642,13 +978,28 @@ def fit(
     )
 
     print(
+        f"Best epoch: "
+        f"{best_epoch}"
+    )
+
+    print(
+        f"Best {best_metric}: "
+        f"{float(best_metrics[best_metric]):.4f}"
+    )
+
+    print(
+        f"Inference threshold: "
+        f"{best_threshold:.6f}"
+    )
+
+    print(
         f"Best checkpoint: "
-        f"{best_checkpoint_path}"
+        f"{best_path}"
     )
 
     print(
         f"Last checkpoint: "
-        f"{last_checkpoint_path}"
+        f"{last_path}"
     )
 
     print(
@@ -658,12 +1009,15 @@ def fit(
 
     return {
         "best_epoch": best_epoch,
-        "best_value": best_value,
+        "best_value": float(
+            best_metrics[best_metric]
+        ),
+        "best_threshold": best_threshold,
         "best_checkpoint": str(
-            best_checkpoint_path
+            best_path
         ),
         "last_checkpoint": str(
-            last_checkpoint_path
+            last_path
         ),
         "history": str(
             history_path
