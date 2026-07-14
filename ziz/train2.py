@@ -1,12 +1,14 @@
 """
-Training utilities for HelmetMicroNeXt.
+Классы:
+    0 = helmet     — каска есть
+    1 = no_helmet  — каски нет, положительный класс
 
-CLASS MAPPING:
-    0 = helmet     = каска есть
-    1 = no_helmet  = каски нет
+Precision, recall, F1 и PR-AUC относятся к классу 1 = no_helmet.
 
-Positive class for precision / recall / F1 / ROC-AUC:
-    1 = no_helmet
+Specificity и FPR характеризуют ошибки на классе 0 = helmet.
+
+Validation не балансируется:
+каждый validation-пример проходит ровно один раз.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ from __future__ import annotations
 import csv
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -30,142 +32,151 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
 
-# Эта строка должна появиться в начале лога через main.py.
-TRAIN_MODULE_VERSION = "fp32-no-amp-v3"
-
-
-@dataclass
-class EpochMetrics:
-    loss: float
-    accuracy: float
-    precision: float
-    recall: float
-    f1: float
-    auc: float
-    tn: int
-    fp: int
-    fn: int
-    tp: int
-
-    def as_dict(self, prefix: str = "") -> dict[str, float | int]:
-        return {
-            f"{prefix}loss": self.loss,
-            f"{prefix}accuracy": self.accuracy,
-            f"{prefix}precision": self.precision,
-            f"{prefix}recall": self.recall,
-            f"{prefix}f1": self.f1,
-            f"{prefix}auc": self.auc,
-            f"{prefix}tn": self.tn,
-            f"{prefix}fp": self.fp,
-            f"{prefix}fn": self.fn,
-            f"{prefix}tp": self.tp,
-        }
+TRAIN_MODULE_VERSION = "fp32-epoch-log-v4"
 
 
 def calculate_metrics(
     targets: list[int],
     probabilities: list[float],
-    average_loss: float,
-    threshold: float = 0.5,
-) -> EpochMetrics:
+    loss: float,
+    threshold: float,
+) -> dict[str, float | int]:
     """
-    Класс 1 = no_helmet считается положительным.
+    Положительный класс:
+        1 = no_helmet
     """
-    y_true = np.asarray(targets, dtype=np.int64)
-    y_prob = np.asarray(probabilities, dtype=np.float64)
-    y_pred = (y_prob >= threshold).astype(np.int64)
 
-    accuracy = float(
-        accuracy_score(y_true, y_pred)
+    y_true = np.asarray(
+        targets,
+        dtype=np.int64,
     )
 
-    precision = float(
-        precision_score(
-            y_true,
-            y_pred,
-            pos_label=1,
-            zero_division=0,
-        )
+    y_prob = np.asarray(
+        probabilities,
+        dtype=np.float64,
     )
 
-    recall = float(
-        recall_score(
-            y_true,
-            y_pred,
-            pos_label=1,
-            zero_division=0,
-        )
-    )
+    y_pred = (
+        y_prob >= threshold
+    ).astype(np.int64)
 
-    f1 = float(
-        f1_score(
-            y_true,
-            y_pred,
-            pos_label=1,
-            zero_division=0,
-        )
-    )
-
-    try:
-        auc = float(
-            roc_auc_score(y_true, y_prob)
-        )
-    except ValueError:
-        # Может произойти, если в выборке присутствует только один класс.
-        auc = float("nan")
-
-    matrix = confusion_matrix(
+    tn, fp, fn, tp = confusion_matrix(
         y_true,
         y_pred,
         labels=[0, 1],
-    )
+    ).ravel()
 
-    tn, fp, fn, tp = matrix.ravel()
+    helmet_count = tn + fp
 
-    return EpochMetrics(
-        loss=float(average_loss),
-        accuracy=accuracy,
-        precision=precision,
-        recall=recall,
-        f1=f1,
-        auc=auc,
-        tn=int(tn),
-        fp=int(fp),
-        fn=int(fn),
-        tp=int(tp),
-    )
+    if helmet_count > 0:
+        specificity = tn / helmet_count
+        fpr = fp / helmet_count
+    else:
+        specificity = 0.0
+        fpr = 0.0
+
+    try:
+        auc = float(
+            roc_auc_score(
+                y_true,
+                y_prob,
+            )
+        )
+    except ValueError:
+        auc = float("nan")
+
+    try:
+        # Average Precision — стандартная оценка PR-кривой.
+        pr_auc = float(
+            average_precision_score(
+                y_true,
+                y_prob,
+            )
+        )
+    except ValueError:
+        pr_auc = float("nan")
+
+    return {
+        "loss": float(loss),
+
+        # Общая метрика по двум классам.
+        "accuracy": float(
+            accuracy_score(
+                y_true,
+                y_pred,
+            )
+        ),
+
+        # Метрики положительного класса 1 = no_helmet.
+        "precision": float(
+            precision_score(
+                y_true,
+                y_pred,
+                pos_label=1,
+                zero_division=0,
+            )
+        ),
+        "recall": float(
+            recall_score(
+                y_true,
+                y_pred,
+                pos_label=1,
+                zero_division=0,
+            )
+        ),
+        "f1": float(
+            f1_score(
+                y_true,
+                y_pred,
+                pos_label=1,
+                zero_division=0,
+            )
+        ),
+
+        # Метрики ранжирования, не зависящие от threshold.
+        "auc": auc,
+        "pr_auc": pr_auc,
+
+        # Поведение на классе 0 = helmet.
+        "specificity": float(specificity),
+        "fpr": float(fpr),
+
+        # Полная confusion matrix.
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
 
 
-def train_one_epoch(
+def run_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
     device: torch.device,
-    max_grad_norm: float | None,
     threshold: float,
-    epoch: int,
-    total_epochs: int,
-) -> EpochMetrics:
-    model.train()
+    optimizer: torch.optim.Optimizer | None = None,
+    max_grad_norm: float | None = None,
+) -> dict[str, float | int]:
+    """
+    Если optimizer передан — train.
+    Если optimizer=None — validation.
 
-    running_loss = 0.0
-    sample_count = 0
+    Прогресс по batch не печатается.
+    """
+
+    training = optimizer is not None
+    model.train(training)
+
+    total_loss = 0.0
+    total_samples = 0
 
     targets: list[int] = []
     probabilities: list[float] = []
 
-    progress = tqdm(
-        loader,
-        desc=f"Train {epoch:03d}/{total_epochs:03d}",
-        leave=False,
-        dynamic_ncols=True,
-    )
-
-    for images, labels, _paths in progress:
+    for images, labels, _paths in loader:
         images = images.to(
             device,
             non_blocking=True,
@@ -174,260 +185,106 @@ def train_one_epoch(
         labels = labels.to(
             device,
             non_blocking=True,
-        ).float()
+        ).float().reshape(-1)
 
-        optimizer.zero_grad(set_to_none=True)
-
-        # Обычный FP32 forward.
-        # Здесь нет torch.amp, GradScaler и autocast.
-        logits = model(images)
-
-        # Защита на случай выхода [B, 1].
-        logits = logits.reshape(-1)
-        labels = labels.reshape(-1)
-
-        loss = criterion(
-            logits,
-            labels,
-        )
-
-        loss.backward()
-
-        if (
-            max_grad_norm is not None
-            and max_grad_norm > 0
-        ):
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=max_grad_norm,
+        if training:
+            optimizer.zero_grad(
+                set_to_none=True,
             )
 
-        optimizer.step()
+        # AMP и autocast намеренно не используются.
+        with torch.set_grad_enabled(training):
+            logits = model(images).reshape(-1)
 
-        batch_size = labels.shape[0]
+            loss = criterion(
+                logits,
+                labels,
+            )
 
-        running_loss += (
+            if training:
+                loss.backward()
+
+                if (
+                    max_grad_norm is not None
+                    and max_grad_norm > 0
+                ):
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_grad_norm,
+                    )
+
+                optimizer.step()
+
+        batch_size = labels.numel()
+
+        total_loss += (
             float(loss.detach().item())
             * batch_size
         )
 
-        sample_count += batch_size
+        total_samples += batch_size
 
-        batch_probabilities = (
-            torch.sigmoid(logits.detach())
-            .cpu()
-            .numpy()
+        batch_probabilities = torch.sigmoid(
+            logits.detach()
         )
 
         probabilities.extend(
-            batch_probabilities.tolist()
+            batch_probabilities
+            .cpu()
+            .tolist()
         )
 
         targets.extend(
             labels.detach()
             .cpu()
             .to(torch.int64)
-            .numpy()
             .tolist()
         )
 
-        current_loss = (
-            running_loss
-            / max(sample_count, 1)
-        )
-
-        progress.set_postfix(
-            loss=f"{current_loss:.4f}"
-        )
-
     average_loss = (
-        running_loss
-        / max(sample_count, 1)
+        total_loss
+        / max(total_samples, 1)
     )
 
     return calculate_metrics(
         targets=targets,
         probabilities=probabilities,
-        average_loss=average_loss,
+        loss=average_loss,
         threshold=threshold,
     )
 
 
-@torch.no_grad()
-def validate_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    threshold: float,
-    epoch: int,
-    total_epochs: int,
-) -> EpochMetrics:
-    model.eval()
-
-    running_loss = 0.0
-    sample_count = 0
-
-    targets: list[int] = []
-    probabilities: list[float] = []
-
-    progress = tqdm(
-        loader,
-        desc=f"Val   {epoch:03d}/{total_epochs:03d}",
-        leave=False,
-        dynamic_ncols=True,
-    )
-
-    for images, labels, _paths in progress:
-        images = images.to(
-            device,
-            non_blocking=True,
-        )
-
-        labels = labels.to(
-            device,
-            non_blocking=True,
-        ).float()
-
-        logits = model(images)
-
-        logits = logits.reshape(-1)
-        labels = labels.reshape(-1)
-
-        loss = criterion(
-            logits,
-            labels,
-        )
-
-        batch_size = labels.shape[0]
-
-        running_loss += (
-            float(loss.item())
-            * batch_size
-        )
-
-        sample_count += batch_size
-
-        batch_probabilities = (
-            torch.sigmoid(logits)
-            .cpu()
-            .numpy()
-        )
-
-        probabilities.extend(
-            batch_probabilities.tolist()
-        )
-
-        targets.extend(
-            labels.cpu()
-            .to(torch.int64)
-            .numpy()
-            .tolist()
-        )
-
-        current_loss = (
-            running_loss
-            / max(sample_count, 1)
-        )
-
-        progress.set_postfix(
-            loss=f"{current_loss:.4f}"
-        )
-
-    average_loss = (
-        running_loss
-        / max(sample_count, 1)
-    )
-
-    return calculate_metrics(
-        targets=targets,
-        probabilities=probabilities,
-        average_loss=average_loss,
-        threshold=threshold,
-    )
-
-
-def get_metric_value(
-    metrics: EpochMetrics,
-    metric_name: str,
-) -> float:
-    allowed_metrics = {
-        "loss",
-        "accuracy",
-        "precision",
-        "recall",
-        "f1",
-        "auc",
-    }
-
-    if metric_name not in allowed_metrics:
-        raise ValueError(
-            f"Unknown metric: {metric_name}. "
-            f"Allowed metrics: {sorted(allowed_metrics)}"
-        )
-
-    return float(
-        getattr(metrics, metric_name)
-    )
-
-
-def metric_improved(
-    current_value: float,
-    best_value: float,
+def metric_is_better(
+    current: float,
+    best: float,
     metric_name: str,
 ) -> bool:
-    if math.isnan(current_value):
+    if math.isnan(current):
         return False
 
-    if metric_name == "loss":
-        return current_value < best_value
+    # Для loss и FPR меньше — лучше.
+    if metric_name in {
+        "loss",
+        "fpr",
+    }:
+        return current < best
 
-    return current_value > best_value
+    return current > best
 
 
-def save_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    epoch: int,
-    best_epoch: int,
-    best_metric_name: str,
-    best_metric_value: float,
-    train_metrics: EpochMetrics,
-    val_metrics: EpochMetrics,
-    extra_config: dict[str, Any],
-) -> None:
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    checkpoint = {
-        "epoch": epoch,
-        "best_epoch": best_epoch,
-        "best_metric_name": best_metric_name,
-        "best_metric_value": best_metric_value,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "train_metrics": train_metrics.as_dict(),
-        "val_metrics": val_metrics.as_dict(),
-        "config": extra_config,
-        "class_mapping": {
-            0: "helmet",
-            1: "no_helmet",
-        },
-        "train_module_version": TRAIN_MODULE_VERSION,
-    }
-
-    if scheduler is not None:
-        checkpoint["scheduler_state_dict"] = (
-            scheduler.state_dict()
-        )
-
-    torch.save(
-        checkpoint,
-        path,
+def format_metrics(
+    metrics: dict[str, float | int],
+) -> str:
+    return (
+        f"loss={metrics['loss']:.4f} | "
+        f"acc={metrics['accuracy']:.4f} | "
+        f"precision={metrics['precision']:.4f} | "
+        f"recall={metrics['recall']:.4f} | "
+        f"f1={metrics['f1']:.4f} | "
+        f"auc={metrics['auc']:.4f} | "
+        f"pr_auc={metrics['pr_auc']:.4f} | "
+        f"specificity={metrics['specificity']:.4f} | "
+        f"fpr={metrics['fpr']:.4f}"
     )
 
 
@@ -435,12 +292,7 @@ def append_history(
     path: Path,
     row: dict[str, Any],
 ) -> None:
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    file_exists = path.exists()
+    new_file = not path.exists()
 
     with path.open(
         "a",
@@ -452,27 +304,62 @@ def append_history(
             fieldnames=list(row.keys()),
         )
 
-        if not file_exists:
+        if new_file:
             writer.writeheader()
 
         writer.writerow(row)
 
 
-def format_metrics(
-    metrics: EpochMetrics,
-) -> str:
-    if math.isnan(metrics.auc):
-        auc_text = "nan"
-    else:
-        auc_text = f"{metrics.auc:.4f}"
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    epoch: int,
+    best_epoch: int,
+    best_metric: str,
+    best_value: float,
+    train_metrics: dict[str, float | int],
+    val_metrics: dict[str, float | int],
+    config: dict[str, Any],
+) -> None:
+    checkpoint = {
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "best_metric": best_metric,
+        "best_value": best_value,
 
-    return (
-        f"loss={metrics.loss:.4f} | "
-        f"accuracy={metrics.accuracy:.4f} | "
-        f"precision={metrics.precision:.4f} | "
-        f"recall={metrics.recall:.4f} | "
-        f"f1={metrics.f1:.4f} | "
-        f"auc={auc_text}"
+        "model_state_dict": (
+            model.state_dict()
+        ),
+
+        "optimizer_state_dict": (
+            optimizer.state_dict()
+        ),
+
+        "scheduler_state_dict": (
+            scheduler.state_dict()
+            if scheduler is not None
+            else None
+        ),
+
+        "train_metrics": train_metrics,
+        "val_metrics": val_metrics,
+        "config": config,
+
+        "class_mapping": {
+            0: "helmet",
+            1: "no_helmet",
+        },
+
+        "train_module_version": (
+            TRAIN_MODULE_VERSION
+        ),
+    }
+
+    torch.save(
+        checkpoint,
+        path,
     )
 
 
@@ -487,19 +374,29 @@ def fit(
     device: torch.device,
     epochs: int,
     output_directory: str | Path,
-    use_amp: bool = False,
     max_grad_norm: float | None = 5.0,
     threshold: float = 0.5,
     best_metric: str = "auc",
     early_stopping_patience: int | None = 20,
     extra_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Основной цикл обучения.
+    allowed_metrics = {
+        "loss",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc",
+        "pr_auc",
+        "specificity",
+        "fpr",
+    }
 
-    Параметр use_amp оставлен для совместимости с main.py,
-    но AMP в этой версии намеренно не используется.
-    """
+    if best_metric not in allowed_metrics:
+        raise ValueError(
+            f"Unknown BEST_METRIC={best_metric!r}. "
+            f"Allowed: {sorted(allowed_metrics)}"
+        )
 
     output_directory = Path(
         output_directory
@@ -525,120 +422,123 @@ def fit(
         / "last.pt"
     )
 
-    # Новый запуск — новая история.
+    # Новый запуск создаёт новую историю.
     if history_path.exists():
         history_path.unlink()
 
-    if best_metric == "loss":
-        best_metric_value = math.inf
+    if best_metric in {
+        "loss",
+        "fpr",
+    }:
+        best_value = math.inf
     else:
-        best_metric_value = -math.inf
+        best_value = -math.inf
 
     best_epoch = 0
     epochs_without_improvement = 0
-
-    run_start = time.perf_counter()
+    training_started = time.perf_counter()
 
     config = dict(
         extra_config or {}
     )
 
-    config["use_amp_requested"] = bool(use_amp)
-    config["use_amp_effective"] = False
-    config["train_module_version"] = (
-        TRAIN_MODULE_VERSION
+    print(
+        f"train.py version: "
+        f"{TRAIN_MODULE_VERSION}"
     )
 
-    print()
-    print("=" * 78)
     print(
-        f"train.py version: {TRAIN_MODULE_VERSION}"
+        "CLASS 0 = helmet | "
+        "CLASS 1 = no_helmet "
+        "(positive class)"
     )
-    print("CLASS 0 = helmet     = каска есть")
-    print("CLASS 1 = no_helmet  = каски нет")
+
     print(
-        "Positive class for precision/recall/F1/AUC: "
-        "1 = no_helmet"
+        f"Best checkpoint metric: "
+        f"val_{best_metric}"
     )
+
     print(
-        f"Checkpoint metric: val_{best_metric}"
+        "AMP: disabled | "
+        "batch progress: disabled"
     )
-    print(
-        "AMP: disabled intentionally for maximum "
-        "PyTorch compatibility"
-    )
-    print("=" * 78)
+
     print()
 
     for epoch in range(
         1,
         epochs + 1,
     ):
-        epoch_start = time.perf_counter()
+        epoch_started = (
+            time.perf_counter()
+        )
 
-        current_lr = float(
+        learning_rate = float(
             optimizer.param_groups[0]["lr"]
         )
 
-        train_metrics = train_one_epoch(
+        train_metrics = run_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
-            optimizer=optimizer,
             device=device,
-            max_grad_norm=max_grad_norm,
             threshold=threshold,
-            epoch=epoch,
-            total_epochs=epochs,
+            optimizer=optimizer,
+            max_grad_norm=max_grad_norm,
         )
 
-        val_metrics = validate_one_epoch(
+        val_metrics = run_epoch(
             model=model,
             loader=val_loader,
             criterion=criterion,
             device=device,
             threshold=threshold,
-            epoch=epoch,
-            total_epochs=epochs,
+            optimizer=None,
+            max_grad_norm=None,
         )
 
-        current_metric_value = get_metric_value(
-            val_metrics,
-            best_metric,
+        current_value = float(
+            val_metrics[best_metric]
         )
 
-        improved = metric_improved(
-            current_value=current_metric_value,
-            best_value=best_metric_value,
+        improved = metric_is_better(
+            current=current_value,
+            best=best_value,
             metric_name=best_metric,
         )
 
         if improved:
-            best_metric_value = (
-                current_metric_value
-            )
-
+            best_value = current_value
             best_epoch = epoch
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
 
-        # Scheduler обновляем после завершённой эпохи.
         if scheduler is not None:
             scheduler.step()
 
         epoch_seconds = (
             time.perf_counter()
-            - epoch_start
+            - epoch_started
         )
 
         history_row: dict[str, Any] = {
             "epoch": epoch,
-            "lr": current_lr,
+            "lr": learning_rate,
             "seconds": epoch_seconds,
-            **train_metrics.as_dict("train_"),
-            **val_metrics.as_dict("val_"),
         }
+
+        history_row.update({
+            f"train_{key}": value
+            for key, value
+            in train_metrics.items()
+        })
+
+        history_row.update({
+            f"val_{key}": value
+            for key, value
+            in val_metrics.items()
+        })
 
         append_history(
             history_path,
@@ -658,11 +558,11 @@ def fit(
             scheduler=scheduler,
             epoch=epoch,
             best_epoch=best_epoch,
-            best_metric_name=best_metric,
-            best_metric_value=best_metric_value,
+            best_metric=best_metric,
+            best_value=best_value,
             train_metrics=train_metrics,
             val_metrics=val_metrics,
-            extra_config=checkpoint_config,
+            config=checkpoint_config,
         )
 
         if improved:
@@ -673,47 +573,45 @@ def fit(
                 scheduler=scheduler,
                 epoch=epoch,
                 best_epoch=best_epoch,
-                best_metric_name=best_metric,
-                best_metric_value=best_metric_value,
+                best_metric=best_metric,
+                best_value=best_value,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                extra_config=checkpoint_config,
+                config=checkpoint_config,
             )
 
-        marker = (
-            "  <-- BEST"
+        best_marker = (
+            " <-- BEST"
             if improved
             else ""
         )
 
         print(
             f"Epoch {epoch:03d}/{epochs:03d} | "
-            f"lr={current_lr:.3e} | "
+            f"lr={learning_rate:.3e} | "
             f"time={epoch_seconds:.1f}s"
-            f"{marker}"
+            f"{best_marker}"
         )
 
         print(
-            f"  train: {format_metrics(train_metrics)}"
+            f"  train: "
+            f"{format_metrics(train_metrics)}"
         )
 
         print(
-            f"  val:   {format_metrics(val_metrics)}"
+            f"  val:   "
+            f"{format_metrics(val_metrics)}"
         )
 
         print(
-            "  val confusion matrix "
-            "(positive class = 1 no_helmet): "
-            f"TN={val_metrics.tn} | "
-            f"FP={val_metrics.fp} | "
-            f"FN={val_metrics.fn} | "
-            f"TP={val_metrics.tp}"
-        )
-
-        print(
-            f"  best epoch={best_epoch:03d} | "
-            f"best val_{best_metric}="
-            f"{best_metric_value:.4f}"
+            "  val confusion: "
+            f"TN={val_metrics['tn']} "
+            f"FP={val_metrics['fp']} "
+            f"FN={val_metrics['fn']} "
+            f"TP={val_metrics['tp']} | "
+            f"best epoch={best_epoch:03d}, "
+            f"val_{best_metric}="
+            f"{best_value:.4f}"
         )
 
         print()
@@ -726,47 +624,41 @@ def fit(
         ):
             print(
                 "Early stopping: "
-                f"val_{best_metric} did not improve "
-                f"for {early_stopping_patience} epochs."
+                f"val_{best_metric} "
+                "did not improve for "
+                f"{early_stopping_patience} "
+                "epochs."
             )
             break
 
-    total_seconds = (
+    total_minutes = (
         time.perf_counter()
-        - run_start
-    )
+        - training_started
+    ) / 60.0
 
-    print()
-    print("=" * 78)
     print(
         f"Training finished in "
-        f"{total_seconds / 60.0:.1f} minutes"
+        f"{total_minutes:.1f} min"
     )
-    print(
-        f"Best epoch: {best_epoch}"
-    )
-    print(
-        f"Best val_{best_metric}: "
-        f"{best_metric_value:.4f}"
-    )
+
     print(
         f"Best checkpoint: "
         f"{best_checkpoint_path}"
     )
+
     print(
         f"Last checkpoint: "
         f"{last_checkpoint_path}"
     )
+
     print(
-        f"History CSV: "
+        f"History: "
         f"{history_path}"
     )
-    print("=" * 78)
 
     return {
         "best_epoch": best_epoch,
-        "best_metric": best_metric,
-        "best_score": best_metric_value,
+        "best_value": best_value,
         "best_checkpoint": str(
             best_checkpoint_path
         ),
