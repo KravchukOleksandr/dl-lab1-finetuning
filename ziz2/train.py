@@ -104,11 +104,16 @@ def parse_args() -> argparse.Namespace:
         help="Balanced train batches per epoch; by default uses ceil(N / batch_size).",
     )
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=3e-3)
-    parser.add_argument("--min-lr", type=float, default=3e-5)
-    parser.add_argument("--warmup-epochs", type=float, default=2.0)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument("--warmup-start-factor", type=float, default=0.2)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--ema-decay", type=float, default=0.997)
+    parser.add_argument(
+        "--ema", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
@@ -144,12 +149,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable CUDA automatic mixed precision.",
     )
     parser.add_argument(
         "--deterministic",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Prefer reproducibility over CUDA speed.",
     )
     valid_keys = {
@@ -253,9 +259,14 @@ def _learning_rate(
     warmup_steps: int,
     max_lr: float,
     min_lr: float,
+    warmup_start_factor: float = 0.0,
 ) -> float:
     if warmup_steps > 0 and step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
+        if warmup_steps == 1:
+            return max_lr
+        progress = step / (warmup_steps - 1)
+        factor = warmup_start_factor + (1.0 - warmup_start_factor) * progress
+        return max_lr * factor
     decay_steps = max(1, total_steps - warmup_steps)
     progress = min(1.0, max(0.0, (step - warmup_steps) / decay_steps))
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -345,6 +356,51 @@ def _checkpoint_selection(
     return float(validation[selection_metric]), None
 
 
+def _checkpoint_selection_rank(
+    validation: dict[str, Any],
+    selection_metric: str,
+    selection_dataset: str | None,
+) -> tuple[float, ...]:
+    """Rank FPR checkpoints like the previous stable training pipeline."""
+    value, threshold = _checkpoint_selection(
+        validation, selection_metric, selection_dataset
+    )
+    if selection_metric == "overall_fpr_at_recall_95":
+        metrics = validation["overall"]
+    elif selection_metric == "dataset_fpr_at_recall_95":
+        if selection_dataset is None:
+            raise ValueError("selection_dataset is required")
+        metrics = validation["datasets"][selection_dataset]
+    else:
+        return (value,)
+    return (
+        value,
+        -float(metrics["achieved_recall_at_95"]),
+        -float(metrics["roc_auc"]),
+        -float(threshold),
+    )
+
+
+def _selection_rank_is_better(
+    current: tuple[float, ...],
+    best: tuple[float, ...] | None,
+    min_delta: float,
+) -> bool:
+    if best is None:
+        return True
+    epsilon = 1e-12
+    if current[0] < best[0] - min_delta:
+        return True
+    if abs(current[0] - best[0]) > epsilon:
+        return False
+    for current_item, best_item in zip(current[1:], best[1:]):
+        if current_item < best_item - epsilon:
+            return True
+        if current_item > best_item + epsilon:
+            return False
+    return False
+
+
 def main() -> None:
     args = parse_args()
 
@@ -373,6 +429,7 @@ def main() -> None:
         seed_worker,
     )
     from training.metrics import validation_metrics
+    from training.ema import ModelEMA
 
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive")
@@ -380,6 +437,8 @@ def main() -> None:
         raise ValueError("Batch sizes must be positive")
     if not 0.0 <= args.warmup_epochs < args.epochs:
         raise ValueError("--warmup-epochs must be >= 0 and < --epochs")
+    if not 0.0 < args.warmup_start_factor <= 1.0:
+        raise ValueError("--warmup-start-factor must be in (0, 1]")
     if not 0.0 <= args.min_lr <= args.lr:
         raise ValueError("Expected 0 <= --min-lr <= --lr")
     if args.workers < 0:
@@ -392,6 +451,8 @@ def main() -> None:
         raise ValueError("--min-epochs must be between 1 and --epochs")
     if args.selection_min_delta < 0:
         raise ValueError("--selection-min-delta cannot be negative")
+    if args.ema and not 0.0 < args.ema_decay < 1.0:
+        raise ValueError("--ema-decay must be in (0, 1)")
     if len(set(args.datasets)) != len(args.datasets):
         raise ValueError("--datasets must not contain duplicate names")
     if args.selection_metric == "dataset_fpr_at_recall_95":
@@ -440,24 +501,27 @@ def main() -> None:
         dataset_weights=args.dataset_weights,
     )
 
-    generator = torch.Generator()
-    generator.manual_seed(args.seed)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(args.seed + 1)
     loader_common = {
         "num_workers": args.workers,
         "pin_memory": device.type == "cuda",
         "persistent_workers": args.workers > 0,
         "worker_init_fn": seed_worker,
-        "generator": generator,
     }
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
+        generator=train_generator,
         **loader_common,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.val_batch_size,
         shuffle=False,
+        generator=val_generator,
         **loader_common,
     )
 
@@ -473,7 +537,9 @@ def main() -> None:
     global_step = 0
     start_epoch = 1
     best_selection_value = math.inf
+    best_selection_rank: tuple[float, ...] | None = None
     epochs_without_improvement = 0
+    checkpoint: dict[str, Any] | None = None
 
     if args.resume is not None:
         checkpoint = _load_checkpoint(torch, args.resume)
@@ -481,7 +547,7 @@ def main() -> None:
             raise ValueError(
                 "Checkpoint dataset order differs from --datasets; refusing to resume"
             )
-        model.load_state_dict(checkpoint["model"])
+        model.load_state_dict(checkpoint.get("raw_model", checkpoint["model"]))
         optimizer.load_state_dict(checkpoint["optimizer"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
@@ -507,6 +573,12 @@ def main() -> None:
                 checkpoint.get("best_macro_cell_loss", math.inf),
             )
         )
+        saved_rank = checkpoint.get("best_selection_rank")
+        best_selection_rank = (
+            tuple(float(item) for item in saved_rank)
+            if saved_rank is not None
+            else (best_selection_value,)
+        )
         epochs_without_improvement = int(
             checkpoint.get("epochs_without_improvement", 0)
         )
@@ -515,6 +587,12 @@ def main() -> None:
                 f"Checkpoint already completed epoch {start_epoch - 1}, "
                 f"but --epochs={args.epochs}"
             )
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+    if ema is not None and checkpoint is not None:
+        ema_state = checkpoint.get("ema_model", checkpoint.get("model"))
+        if ema_state is not None:
+            ema.module.load_state_dict(ema_state)
 
     config = vars(args).copy()
     config.update(
@@ -547,6 +625,7 @@ def main() -> None:
     _write_json(output_dir / "config.json", config)
 
     print(f"Device: {device}; AMP: {amp_enabled}")
+    print(f"EMA: {args.ema} (decay {args.ema_decay:g})")
     print(f"Model parameters: {count_trainable_parameters(model):,}")
     print(
         f"Train: {len(train_samples):,} files, {len(train_loader):,} batches/epoch; "
@@ -582,6 +661,7 @@ def main() -> None:
                 warmup_steps,
                 args.lr,
                 args.min_lr,
+                args.warmup_start_factor,
             )
             for group in optimizer.param_groups:
                 group["lr"] = last_lr
@@ -600,6 +680,8 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
 
             batch_count = int(targets.numel())
             loss_sum += float(loss.detach()) * batch_count
@@ -614,7 +696,8 @@ def main() -> None:
 
     @torch.inference_mode()
     def validate() -> dict[str, Any]:
-        model.eval()
+        evaluation_model = ema.module if ema is not None else model
+        evaluation_model.eval()
         all_logits: list[Any] = []
         all_targets: list[Any] = []
         all_losses: list[Any] = []
@@ -627,7 +710,7 @@ def main() -> None:
                 dtype=torch.float16,
                 enabled=amp_enabled,
             ):
-                logits = model(images)
+                logits = evaluation_model(images)
                 losses = functional.binary_cross_entropy_with_logits(
                     logits,
                     targets_device,
@@ -654,12 +737,19 @@ def main() -> None:
             args.selection_metric,
             args.selection_dataset,
         )
-        improved = (
-            selection_value
-            < best_selection_value - args.selection_min_delta
+        selection_rank = _checkpoint_selection_rank(
+            val_metrics,
+            args.selection_metric,
+            args.selection_dataset,
+        )
+        improved = _selection_rank_is_better(
+            selection_rank,
+            best_selection_rank,
+            args.selection_min_delta,
         )
         if improved:
             best_selection_value = selection_value
+            best_selection_rank = selection_rank
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -669,7 +759,11 @@ def main() -> None:
         payload = {
             "epoch": epoch,
             "global_step": global_step,
-            "model": model.state_dict(),
+            # `model` is always inference-ready (EMA when enabled).
+            "model": (ema.module if ema is not None else model).state_dict(),
+            "raw_model": model.state_dict(),
+            "ema_model": ema.module.state_dict() if ema is not None else None,
+            "ema_enabled": ema is not None,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "selection_metric": args.selection_metric,
@@ -677,6 +771,7 @@ def main() -> None:
             "selection_value": selection_value,
             "operating_threshold": selection_threshold,
             "best_selection_value": best_selection_value,
+            "best_selection_rank": list(best_selection_rank),
             "epochs_without_improvement": epochs_without_improvement,
             "validation": val_metrics,
             "dataset_names": list(args.datasets),
