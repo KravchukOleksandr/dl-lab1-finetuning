@@ -1,0 +1,13 @@
+# Структура data_root: val/helmet и val/no_helmet.
+data_root: .
+
+# Можно указать публичный checkpoint или результат fine-tune.
+checkpoint: models/factory_finetune/best.pt
+output_json: models/validation_metrics.json
+
+batch_size: 256
+workers: 4
+seed: 42
+device: auto
+amp: true
+deterministic: false

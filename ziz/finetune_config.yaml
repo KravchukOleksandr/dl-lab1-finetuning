@@ -1,0 +1,33 @@
+# Структура data_root:
+#   train/helmet, train/no_helmet, val/helmet, val/no_helmet
+# Относительные пути считаются от папки, где лежат скрипты.
+data_root: .
+
+# Стартовая публично предобученная модель.
+initial_checkpoint: models/best_fpr95.pt
+output_dir: models/factory_finetune
+resume: null  # Для продолжения: models/factory_finetune/last.pt
+
+epochs: 15
+batch_size: 128       # Чётное: половина helmet, половина no_helmet.
+val_batch_size: 256
+batches_per_epoch: null
+workers: 4
+
+# AdamW и cosine scheduler. LR существенно меньше, чем при pretrain.
+lr: 0.0002
+min_lr: 0.000005
+warmup_epochs: 1.0
+weight_decay: 0.0001
+grad_clip: 1.0
+
+# best.pt выбирается по минимальному FPR при Recall(no_helmet) >= 95%.
+selection_min_delta: 0.0001
+min_epochs: 5
+early_stopping_patience: 5
+save_every: 5
+
+seed: 42
+device: auto
+amp: true
+deterministic: false
