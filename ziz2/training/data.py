@@ -118,24 +118,63 @@ def discover_single_dataset_samples(
     return samples
 
 
+def _centered_square(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    side = min(height, width)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    return image[top : top + side, left : left + side]
+
+
+def _original_box_coverage(
+    crop_box: tuple[float, float, float, float],
+    original_box: tuple[float, float, float, float],
+) -> tuple[float, float, float]:
+    left, top, right, bottom = crop_box
+    original_left, original_top, original_right, original_bottom = original_box
+    intersection_width = max(
+        0.0, min(right, original_right) - max(left, original_left)
+    )
+    intersection_height = max(
+        0.0, min(bottom, original_bottom) - max(top, original_top)
+    )
+    original_width = max(original_right - original_left, 1e-6)
+    original_height = max(original_bottom - original_top, 1e-6)
+    coverage_x = intersection_width / original_width
+    coverage_y = intersection_height / original_height
+    top_loss = max(0.0, top - original_top) / original_height
+    return coverage_x, coverage_y, top_loss
+
+
 def _square_crop(image: np.ndarray, train: bool) -> np.ndarray:
+    if not train:
+        return _centered_square(image)
+
     height, width = image.shape[:2]
     max_side = min(height, width)
-    if train:
+    shift_limit = 0.03 * max_side
+    # Stored crops are x1.25 expansions, so the original annotation occupies
+    # approximately the central 80% of the crop on both axes.
+    original_box = (0.10 * width, 0.10 * height, 0.90 * width, 0.90 * height)
+
+    for _ in range(20):
         square_side = int(round(random.uniform(0.90, 1.00) * max_side))
         square_side = max(1, min(square_side, max_side))
-        shift_limit = 0.03 * max_side
         center_x = width / 2.0 + random.uniform(-shift_limit, shift_limit)
         center_y = height / 2.0 + random.uniform(-shift_limit, shift_limit)
         left = int(round(center_x - square_side / 2.0))
         top = int(round(center_y - square_side / 2.0))
         left = min(max(left, 0), width - square_side)
         top = min(max(top, 0), height - square_side)
-    else:
-        square_side = max_side
-        left = (width - square_side) // 2
-        top = (height - square_side) // 2
-    return image[top : top + square_side, left : left + square_side]
+        right = left + square_side
+        bottom = top + square_side
+        coverage_x, coverage_y, top_loss = _original_box_coverage(
+            (left, top, right, bottom), original_box
+        )
+        if coverage_x >= 0.90 and coverage_y >= 0.90 and top_loss <= 0.05:
+            return image[top:bottom, left:right]
+
+    return _centered_square(image)
 
 
 def _photometric_augmentation(image: np.ndarray) -> np.ndarray:
