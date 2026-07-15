@@ -15,28 +15,31 @@ dataset_weights:
   # factory: 3.0
 
 # Основные параметры обучения.
-epochs: 30
+epochs: 40
 batch_size: 192       # Должен быть чётным и достаточным для всех датасетов.
 val_batch_size: 256
 batches_per_epoch: null # Автоматически: ceil(73116 / 192) = 381.
 workers: 4
 
 # AdamW и scheduler.
-lr: 0.003
-min_lr: 0.00003
-warmup_epochs: 2.0
+lr: 0.001
+min_lr: 0.00001
+warmup_epochs: 3.0
+warmup_start_factor: 0.20
 weight_decay: 0.0001
-grad_clip: 1.0       # 0 отключает gradient clipping.
+grad_clip: 5.0       # 0 отключает gradient clipping.
+ema: true
+ema_decay: 0.997
 
 # Окружение и воспроизводимость.
 seed: 42
 device: auto         # auto, cpu, cuda, cuda:0 или mps.
-amp: true            # Mixed precision используется только на CUDA.
-deterministic: false
+amp: false           # FP32 как в стабильном исходном обучении.
+deterministic: true
 
 # Checkpoints и результаты.
-output_dir: runs/internet_pretrain_target
-resume: null         # Например: runs/internet_pretrain_target/last.pt
+output_dir: runs/joint_stable
+resume: null         # Например: runs/joint_stable/last.pt
 save_every: 5        # 0 отключает периодические epoch_*.pt.
 
 # best.pt выбирается по основной метрике: минимизируем худший FPR@R95 среди
@@ -46,6 +49,6 @@ selection_dataset: null
 # Для совместного обучения с выбором модели только по заводу:
 # selection_metric: dataset_fpr_at_recall_95
 # selection_dataset: factory
-selection_min_delta: 0.0001  # Минимальное улучшение: 0.01 процентного пункта.
-min_epochs: 10
-early_stopping_patience: 8
+selection_min_delta: 0.0
+min_epochs: 1
+early_stopping_patience: 0  # Не останавливаемся по дискретной шумной метрике.
