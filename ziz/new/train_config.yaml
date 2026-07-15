@@ -1,0 +1,38 @@
+# Датасеты. Относительные пути считаются от корня проекта.
+data_root: data_prep
+datasets:
+  - shel5k
+  - sfchd
+  - shwd
+
+# Основные параметры обучения.
+epochs: 30
+batch_size: 192       # Должен делиться на 6: dataset x class.
+val_batch_size: 256
+batches_per_epoch: null # Автоматически: ceil(73116 / 192) = 381.
+workers: 4
+
+# AdamW и scheduler.
+lr: 0.003
+min_lr: 0.00003
+warmup_epochs: 2.0
+weight_decay: 0.0001
+grad_clip: 1.0       # 0 отключает gradient clipping.
+
+# Окружение и воспроизводимость.
+seed: 42
+device: auto         # auto, cpu, cuda, cuda:0 или mps.
+amp: true            # Mixed precision используется только на CUDA.
+deterministic: false
+
+# Checkpoints и результаты.
+output_dir: runs/internet_pretrain_target
+resume: null         # Например: runs/internet_pretrain_target/last.pt
+save_every: 5        # 0 отключает периодические epoch_*.pt.
+
+# best.pt выбирается по основной метрике: минимизируем худший FPR@R95 среди
+# трёх датасетов. Так хороший результат на SHWD не скрывает деградацию SHEL5K.
+selection_metric: worst_dataset_fpr_at_recall_95
+selection_min_delta: 0.0001  # Минимальное улучшение: 0.01 процентного пункта.
+min_epochs: 10
+early_stopping_patience: 8
