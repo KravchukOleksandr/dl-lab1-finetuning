@@ -66,10 +66,35 @@ def fpr_at_recall(
         np.r_[ordered_scores[:-1] != ordered_scores[1:], True]
     )
     recalls = cumulative_tp[group_ends] / positive_count
+    false_positive_rates = cumulative_fp[group_ends] / negative_count
     eligible = np.flatnonzero(recalls >= target_recall)
     if len(eligible) == 0:
         return math.nan, math.nan, math.nan
-    end_index = group_ends[eligible[0]]
+    minimum_fpr = float(false_positive_rates[eligible].min())
+    candidates = eligible[
+        np.isclose(
+            false_positive_rates[eligible],
+            minimum_fpr,
+            atol=1e-12,
+            rtol=0.0,
+        )
+    ]
+    maximum_recall = float(recalls[candidates].max())
+    candidates = candidates[
+        np.isclose(
+            recalls[candidates],
+            maximum_recall,
+            atol=1e-12,
+            rtol=0.0,
+        )
+    ]
+    # If several candidates remain, prefer the highest threshold.
+    candidate_end_indices = group_ends[candidates]
+    end_index = int(
+        candidate_end_indices[
+            np.argmax(ordered_scores[candidate_end_indices])
+        ]
+    )
     threshold = float(ordered_scores[end_index])
     recall = float(cumulative_tp[end_index] / positive_count)
     fpr = float(cumulative_fp[end_index] / negative_count)
