@@ -1,22 +1,7 @@
-"""
-Validation HelmetMicroNeXt.
-
-Использование:
-    python3 val.py helmet_finetuned.pt
-
-или:
-    python3 val.py ./models/helmet_finetuned.pt
-
-На вход требуется только файл весов.
-
-Классы:
-    0 = helmet
-    1 = no_helmet, positive class
-"""
-
 from __future__ import annotations
 
-import argparse
+import csv
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -31,7 +16,6 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 from torch.utils.data import DataLoader
 
@@ -45,49 +29,47 @@ from preprocessing import (
 
 
 # =============================================================================
-# КОНФИГУРАЦИЯ
+# CONFIG
 # =============================================================================
 
 DATASET_ROOT = Path("./ziz-crops-202607-2")
 
-MODELS_DIRECTORY = Path("./models")
+WEIGHTS_PATH = Path(
+    "./models/helmet_finetuned.pt"
+)
+
+DECISION_THRESHOLD = 0.358260
+
+ERRORS_DIRECTORY = Path("./val_errors")
+
+SAVE_ERRORS = True
+
+# True:
+#     перед каждой валидацией удалять старые FP/FN.
+#
+# False:
+#     оставлять старые файлы и дописывать новые.
+CLEAR_ERROR_DIRECTORIES = True
 
 IMAGE_SIZE = 64
 BATCH_SIZE = 512
 NUM_WORKERS = 4
-
-TARGET_RECALL = 0.95
-FIXED_THRESHOLD = 0.50
-
 PIN_MEMORY = True
 
 
 # =============================================================================
-# ЗАГРУЗКА ВЕСОВ
+# CHECKPOINT
 # =============================================================================
-
-def resolve_weights_path(argument: str) -> Path:
-    direct_path = Path(argument)
-
-    if direct_path.exists():
-        return direct_path
-
-    models_path = MODELS_DIRECTORY / argument
-
-    if models_path.exists():
-        return models_path
-
-    raise FileNotFoundError(
-        "Файл весов не найден.\n"
-        f"Проверен путь: {direct_path.resolve()}\n"
-        f"Проверен путь: {models_path.resolve()}"
-    )
-
 
 def load_torch_file(
     path: Path,
-    map_location: str | torch.device,
+    map_location: str | torch.device = "cpu",
 ) -> Any:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Weights not found: {path.resolve()}"
+        )
+
     try:
         return torch.load(
             path,
@@ -101,7 +83,9 @@ def load_torch_file(
         )
 
 
-def looks_like_state_dict(value: Any) -> bool:
+def looks_like_state_dict(
+    value: Any,
+) -> bool:
     if not isinstance(value, Mapping):
         return False
 
@@ -110,30 +94,33 @@ def looks_like_state_dict(value: Any) -> bool:
 
     return all(
         isinstance(key, str)
-        for key in value
-    ) and any(
-        torch.is_tensor(item)
-        for item in value.values()
+        and torch.is_tensor(tensor)
+        for key, tensor in value.items()
     )
 
 
-def extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
+def extract_state_dict(
+    checkpoint: Any,
+) -> dict[str, torch.Tensor]:
     if looks_like_state_dict(checkpoint):
         return dict(checkpoint)
 
     if not isinstance(checkpoint, Mapping):
         raise TypeError(
-            f"Unsupported weights object: "
+            "Unsupported checkpoint type: "
             f"{type(checkpoint)}"
         )
 
-    for key in (
+    candidate_keys = (
         "model_state_dict",
-        "state_dict",
         "ema_state_dict",
+        "state_dict",
         "weights",
         "model",
-    ):
+        "raw_model_state_dict",
+    )
+
+    for key in candidate_keys:
         value = checkpoint.get(key)
 
         if looks_like_state_dict(value):
@@ -141,6 +128,7 @@ def extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
                 f"State dict source: "
                 f"checkpoint[{key!r}]"
             )
+
             return dict(value)
 
     raise KeyError(
@@ -149,7 +137,9 @@ def extract_state_dict(checkpoint: Any) -> dict[str, torch.Tensor]:
     )
 
 
-def strip_common_prefixes(key: str) -> str:
+def normalize_state_key(
+    key: str,
+) -> str:
     prefixes = (
         "module.",
         "model.",
@@ -175,13 +165,8 @@ def strip_common_prefixes(key: str) -> str:
 
 def load_model_weights(
     model: torch.nn.Module,
-    weights_path: Path,
+    checkpoint: Any,
 ) -> None:
-    checkpoint = load_torch_file(
-        weights_path,
-        map_location="cpu",
-    )
-
     source_state = extract_state_dict(
         checkpoint
     )
@@ -189,28 +174,30 @@ def load_model_weights(
     target_state = model.state_dict()
 
     normalized_source = {
-        strip_common_prefixes(key): value
-        for key, value in source_state.items()
+        normalize_state_key(key): tensor
+        for key, tensor in source_state.items()
     }
 
     mapped_state: dict[str, torch.Tensor] = {}
 
-    for target_key, target_value in target_state.items():
-        source_value = normalized_source.get(
+    for target_key, target_tensor in target_state.items():
+        source_tensor = normalized_source.get(
             target_key
         )
 
-        if source_value is None:
+        if source_tensor is None:
             continue
 
-        if tuple(source_value.shape) != tuple(target_value.shape):
+        if tuple(source_tensor.shape) != tuple(
+            target_tensor.shape
+        ):
             raise RuntimeError(
                 f"Shape mismatch for {target_key}: "
-                f"weights={tuple(source_value.shape)}, "
-                f"model={tuple(target_value.shape)}"
+                f"checkpoint={tuple(source_tensor.shape)}, "
+                f"model={tuple(target_tensor.shape)}"
             )
 
-        mapped_state[target_key] = source_value
+        mapped_state[target_key] = source_tensor
 
     missing_keys = [
         key
@@ -223,32 +210,17 @@ def load_model_weights(
 
     if missing_keys:
         raise RuntimeError(
-            "Weights are not compatible with model.py.\n"
-            "Missing keys:\n"
+            "Weights are incompatible with model.py.\n"
             + "\n".join(
-                f"  {key}"
+                f"Missing: {key}"
                 for key in missing_keys[:30]
             )
         )
 
-    result = model.load_state_dict(
+    model.load_state_dict(
         mapped_state,
         strict=False,
     )
-
-    unexpected_missing = [
-        key
-        for key in result.missing_keys
-        if not key.endswith(
-            "num_batches_tracked"
-        )
-    ]
-
-    if unexpected_missing:
-        raise RuntimeError(
-            f"Missing model keys: "
-            f"{unexpected_missing}"
-        )
 
     print(
         f"Loaded tensors: "
@@ -257,168 +229,96 @@ def load_model_weights(
 
 
 # =============================================================================
-# МЕТРИКИ
+# ERROR DIRECTORIES
 # =============================================================================
 
-def calculate_fixed_metrics(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    threshold: float,
-) -> dict[str, float | int]:
-    y_pred = (
-        y_prob >= threshold
-    ).astype(np.int64)
-
-    tn, fp, fn, tp = confusion_matrix(
-        y_true,
-        y_pred,
-        labels=[0, 1],
-    ).ravel()
-
-    fpr = fp / max(fp + tn, 1)
-    specificity = tn / max(tn + fp, 1)
-
-    return {
-        "threshold": float(threshold),
-        "accuracy": float(
-            accuracy_score(y_true, y_pred)
-        ),
-        "precision": float(
-            precision_score(
-                y_true,
-                y_pred,
-                pos_label=1,
-                zero_division=0,
-            )
-        ),
-        "recall": float(
-            recall_score(
-                y_true,
-                y_pred,
-                pos_label=1,
-                zero_division=0,
-            )
-        ),
-        "f1": float(
-            f1_score(
-                y_true,
-                y_pred,
-                pos_label=1,
-                zero_division=0,
-            )
-        ),
-        "specificity": float(specificity),
-        "fpr": float(fpr),
-        "tn": int(tn),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tp": int(tp),
-    }
-
-
-def calculate_operating_point(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    target_recall: float,
-) -> dict[str, float | int]:
-    """
-    Выбирает точку с минимальным FPR при recall >= target_recall.
-
-    При одинаковом FPR:
-        1. выбирается больший recall;
-        2. затем более высокий threshold.
-    """
-
-    fpr_values, recall_values, thresholds = roc_curve(
-        y_true,
-        y_prob,
-        pos_label=1,
-        drop_intermediate=False,
+def prepare_error_directories() -> tuple[Path, Path]:
+    fp_directory = (
+        ERRORS_DIRECTORY
+        / "FP"
     )
 
-    valid_indices = np.flatnonzero(
-        recall_values >= target_recall
+    fn_directory = (
+        ERRORS_DIRECTORY
+        / "FN"
     )
 
-    if valid_indices.size == 0:
-        raise RuntimeError(
-            f"Recall {target_recall:.4f} unreachable"
+    if (
+        CLEAR_ERROR_DIRECTORIES
+        and ERRORS_DIRECTORY.exists()
+    ):
+        shutil.rmtree(
+            ERRORS_DIRECTORY
         )
 
-    minimum_fpr = np.min(
-        fpr_values[valid_indices]
+    fp_directory.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    candidates = valid_indices[
-        np.isclose(
-            fpr_values[valid_indices],
-            minimum_fpr,
-            atol=1e-12,
-            rtol=0.0,
-        )
-    ]
-
-    maximum_recall = np.max(
-        recall_values[candidates]
+    fn_directory.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    candidates = candidates[
-        np.isclose(
-            recall_values[candidates],
-            maximum_recall,
-            atol=1e-12,
-            rtol=0.0,
-        )
-    ]
+    return (
+        fp_directory,
+        fn_directory,
+    )
 
-    best_index = int(
-        candidates[
-            np.argmax(
-                thresholds[candidates]
+
+def create_unique_destination(
+    directory: Path,
+    source_path: Path,
+) -> Path:
+    destination = (
+        directory
+        / source_path.name
+    )
+
+    if not destination.exists():
+        return destination
+
+    counter = 2
+
+    while True:
+        candidate = (
+            directory
+            / (
+                f"{source_path.stem}"
+                f"__{counter}"
+                f"{source_path.suffix}"
             )
-        ]
-    )
-
-    threshold = float(
-        thresholds[best_index]
-    )
-
-    y_pred = (
-        y_prob >= threshold
-    ).astype(np.int64)
-
-    tn, fp, fn, tp = confusion_matrix(
-        y_true,
-        y_pred,
-        labels=[0, 1],
-    ).ravel()
-
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    fpr = fp / max(fp + tn, 1)
-
-    if precision + recall > 0:
-        f1 = (
-            2.0
-            * precision
-            * recall
-            / (precision + recall)
         )
-    else:
-        f1 = 0.0
 
-    return {
-        "threshold": threshold,
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "fpr": float(fpr),
-        "specificity": float(1.0 - fpr),
-        "tn": int(tn),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tp": int(tp),
-    }
+        if not candidate.exists():
+            return candidate
+
+        counter += 1
+
+
+def copy_error_image(
+    source_path: str | Path,
+    destination_directory: Path,
+) -> Path:
+    source = Path(source_path)
+
+    if not source.exists():
+        raise FileNotFoundError(
+            f"Validation image not found: {source}"
+        )
+
+    destination = create_unique_destination(
+        destination_directory,
+        source,
+    )
+
+    shutil.copy2(
+        source,
+        destination,
+    )
+
+    return destination
 
 
 # =============================================================================
@@ -430,13 +330,28 @@ def collect_predictions(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    list[str],
+]:
     model.eval()
 
-    targets: list[int] = []
+    labels: list[int] = []
     probabilities: list[float] = []
+    paths: list[str] = []
 
-    for images, labels, _paths in loader:
+    for batch in loader:
+        if len(batch) < 3:
+            raise RuntimeError(
+                "Dataset must return: "
+                "(image, label, path)"
+            )
+
+        images = batch[0]
+        batch_labels = batch[1]
+        batch_paths = batch[2]
+
         images = images.to(
             device,
             non_blocking=True,
@@ -450,22 +365,167 @@ def collect_predictions(
             logits
         )
 
+        labels.extend(
+            batch_labels
+            .reshape(-1)
+            .to(torch.int64)
+            .cpu()
+            .tolist()
+        )
+
         probabilities.extend(
             batch_probabilities
             .cpu()
             .tolist()
         )
 
-        targets.extend(
-            labels
-            .to(torch.int64)
-            .reshape(-1)
-            .tolist()
+        paths.extend(
+            str(path)
+            for path in batch_paths
         )
 
     return (
-        np.asarray(targets, dtype=np.int64),
-        np.asarray(probabilities, dtype=np.float64),
+        np.asarray(
+            labels,
+            dtype=np.int64,
+        ),
+        np.asarray(
+            probabilities,
+            dtype=np.float64,
+        ),
+        paths,
+    )
+
+
+# =============================================================================
+# SAVE FP/FN
+# =============================================================================
+
+def save_validation_errors(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    predictions: np.ndarray,
+    paths: list[str],
+) -> tuple[int, int, Path]:
+    fp_directory, fn_directory = (
+        prepare_error_directories()
+    )
+
+    report_path = (
+        ERRORS_DIRECTORY
+        / "errors.csv"
+    )
+
+    false_positive_count = 0
+    false_negative_count = 0
+
+    with report_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        fieldnames = (
+            "error_type",
+            "source_path",
+            "saved_path",
+            "true_label",
+            "true_class",
+            "predicted_label",
+            "predicted_class",
+            "probability_no_helmet",
+            "threshold",
+        )
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fieldnames,
+        )
+
+        writer.writeheader()
+
+        for (
+            true_label,
+            probability,
+            prediction,
+            source_path,
+        ) in zip(
+            labels,
+            probabilities,
+            predictions,
+            paths,
+            strict=True,
+        ):
+            error_type: str | None = None
+            destination_directory: Path | None = None
+
+            if (
+                true_label == 0
+                and prediction == 1
+            ):
+                error_type = "FP"
+                destination_directory = (
+                    fp_directory
+                )
+
+                false_positive_count += 1
+
+            elif (
+                true_label == 1
+                and prediction == 0
+            ):
+                error_type = "FN"
+                destination_directory = (
+                    fn_directory
+                )
+
+                false_negative_count += 1
+
+            if error_type is None:
+                continue
+
+            saved_path = copy_error_image(
+                source_path=source_path,
+                destination_directory=(
+                    destination_directory
+                ),
+            )
+
+            writer.writerow(
+                {
+                    "error_type": error_type,
+                    "source_path": source_path,
+                    "saved_path": str(
+                        saved_path.resolve()
+                    ),
+                    "true_label": int(
+                        true_label
+                    ),
+                    "true_class": (
+                        "helmet"
+                        if true_label == 0
+                        else "no_helmet"
+                    ),
+                    "predicted_label": int(
+                        prediction
+                    ),
+                    "predicted_class": (
+                        "helmet"
+                        if prediction == 0
+                        else "no_helmet"
+                    ),
+                    "probability_no_helmet": (
+                        f"{probability:.9f}"
+                    ),
+                    "threshold": (
+                        f"{DECISION_THRESHOLD:.9f}"
+                    ),
+                }
+            )
+
+    return (
+        false_positive_count,
+        false_negative_count,
+        report_path,
     )
 
 
@@ -473,41 +533,34 @@ def collect_predictions(
 # MAIN
 # =============================================================================
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Validate HelmetMicroNeXt weights"
-        )
-    )
-
-    parser.add_argument(
-        "weights",
-        type=str,
-        help=(
-            "Weights path or filename inside ./models"
-        ),
-    )
-
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = parse_arguments()
+    if not 0.0 <= DECISION_THRESHOLD <= 1.0:
+        raise ValueError(
+            "DECISION_THRESHOLD must be "
+            "inside [0, 1]"
+        )
 
-    weights_path = resolve_weights_path(
-        args.weights
+    weights_path = (
+        WEIGHTS_PATH
+        .expanduser()
+        .resolve()
     )
 
     validation_directory = (
         DATASET_ROOT
         / "val"
-    )
+    ).expanduser().resolve()
 
     if not validation_directory.exists():
         raise FileNotFoundError(
-            f"Validation directory not found: "
-            f"{validation_directory.resolve()}"
+            "Validation directory not found: "
+            f"{validation_directory}"
         )
+
+    checkpoint = load_torch_file(
+        weights_path,
+        map_location="cpu",
+    )
 
     device = torch.device(
         "cuda"
@@ -519,7 +572,7 @@ def main() -> None:
 
     load_model_weights(
         model=model,
-        weights_path=weights_path,
+        checkpoint=checkpoint,
     )
 
     model = model.to(device)
@@ -553,109 +606,157 @@ def main() -> None:
         drop_last=False,
     )
 
-    y_true, y_prob = collect_predictions(
+    (
+        labels,
+        probabilities,
+        paths,
+    ) = collect_predictions(
         model=model,
         loader=loader,
         device=device,
     )
 
-    auc = float(
-        roc_auc_score(
-            y_true,
-            y_prob,
+    predictions = (
+        probabilities
+        >= DECISION_THRESHOLD
+    ).astype(np.int64)
+
+    tn, fp, fn, tp = confusion_matrix(
+        labels,
+        predictions,
+        labels=[0, 1],
+    ).ravel()
+
+    accuracy = accuracy_score(
+        labels,
+        predictions,
+    )
+
+    precision = precision_score(
+        labels,
+        predictions,
+        pos_label=1,
+        zero_division=0,
+    )
+
+    recall = recall_score(
+        labels,
+        predictions,
+        pos_label=1,
+        zero_division=0,
+    )
+
+    f1 = f1_score(
+        labels,
+        predictions,
+        pos_label=1,
+        zero_division=0,
+    )
+
+    specificity = (
+        tn
+        / max(tn + fp, 1)
+    )
+
+    false_positive_rate = (
+        fp
+        / max(fp + tn, 1)
+    )
+
+    roc_auc = roc_auc_score(
+        labels,
+        probabilities,
+    )
+
+    pr_auc = average_precision_score(
+        labels,
+        probabilities,
+    )
+
+    if SAVE_ERRORS:
+        (
+            saved_fp_count,
+            saved_fn_count,
+            report_path,
+        ) = save_validation_errors(
+            labels=labels,
+            probabilities=probabilities,
+            predictions=predictions,
+            paths=paths,
         )
-    )
 
-    pr_auc = float(
-        average_precision_score(
-            y_true,
-            y_prob,
-        )
-    )
+        if saved_fp_count != fp:
+            raise RuntimeError(
+                "Saved FP count does not match "
+                f"confusion matrix: "
+                f"{saved_fp_count} != {fp}"
+            )
 
-    fixed = calculate_fixed_metrics(
-        y_true=y_true,
-        y_prob=y_prob,
-        threshold=FIXED_THRESHOLD,
-    )
-
-    operating = calculate_operating_point(
-        y_true=y_true,
-        y_prob=y_prob,
-        target_recall=TARGET_RECALL,
-    )
-
-    class_counts = dataset.class_counts()
+        if saved_fn_count != fn:
+            raise RuntimeError(
+                "Saved FN count does not match "
+                f"confusion matrix: "
+                f"{saved_fn_count} != {fn}"
+            )
 
     print()
     print("=" * 78)
     print("CLASS 0 = helmet")
-    print("CLASS 1 = no_helmet, positive class")
-    print(f"Weights: {weights_path.resolve()}")
+    print("CLASS 1 = no_helmet")
+    print(f"Weights: {weights_path}")
     print(f"Device: {device}")
     print(
-        f"Validation images: {len(dataset)} "
-        f"(helmet={class_counts[0]}, "
-        f"no_helmet={class_counts[1]})"
+        f"Validation images: {len(dataset)}"
+    )
+    print(
+        f"Threshold: "
+        f"{DECISION_THRESHOLD:.9f}"
     )
     print("-" * 78)
-
-    print(f"ROC-AUC: {auc:.6f}")
-    print(f"PR-AUC:  {pr_auc:.6f}")
-
+    print(
+        f"Accuracy:    {accuracy:.6f}"
+    )
+    print(
+        f"Precision:   {precision:.6f}"
+    )
+    print(
+        f"Recall:      {recall:.6f}"
+    )
+    print(
+        f"F1:          {f1:.6f}"
+    )
+    print(
+        f"Specificity: {specificity:.6f}"
+    )
+    print(
+        f"FPR:         "
+        f"{false_positive_rate:.6f}"
+    )
+    print(
+        f"ROC-AUC:     {roc_auc:.6f}"
+    )
+    print(
+        f"PR-AUC:      {pr_auc:.6f}"
+    )
     print("-" * 78)
     print(
-        f"Fixed threshold = "
-        f"{FIXED_THRESHOLD:.6f}"
+        f"TN={tn} FP={fp} FN={fn} TP={tp}"
     )
 
-    print(
-        f"accuracy={fixed['accuracy']:.6f} | "
-        f"precision={fixed['precision']:.6f} | "
-        f"recall={fixed['recall']:.6f} | "
-        f"f1={fixed['f1']:.6f}"
-    )
-
-    print(
-        f"specificity={fixed['specificity']:.6f} | "
-        f"fpr={fixed['fpr']:.6f}"
-    )
-
-    print(
-        f"TN={fixed['tn']} "
-        f"FP={fixed['fp']} "
-        f"FN={fixed['fn']} "
-        f"TP={fixed['tp']}"
-    )
-
-    print("-" * 78)
-    print(
-        "Operating point: minimum FPR "
-        f"at recall >= {TARGET_RECALL:.2f}"
-    )
-
-    print(
-        f"threshold={operating['threshold']:.9f}"
-    )
-
-    print(
-        f"recall={operating['recall']:.6f} | "
-        f"fpr={operating['fpr']:.6f} | "
-        f"precision={operating['precision']:.6f} | "
-        f"f1={operating['f1']:.6f}"
-    )
-
-    print(
-        f"specificity="
-        f"{operating['specificity']:.6f}"
-    )
-
-    print(
-        f"TN={operating['tn']} "
-        f"FP={operating['fp']} "
-        f"FN={operating['fn']} "
-        f"TP={operating['tp']}"
-    )
+    if SAVE_ERRORS:
+        print("-" * 78)
+        print(
+            f"FP directory: "
+            f"{(ERRORS_DIRECTORY / 'FP').resolve()}"
+        )
+        print(
+            f"FN directory: "
+            f"{(ERRORS_DIRECTORY / 'FN').resolve()}"
+        )
+        print(
+            f"Error report: "
+            f"{report_path.resolve()}"
+        )
 
     print("=" * 78)
     print()
